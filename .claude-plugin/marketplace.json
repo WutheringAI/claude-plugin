@@ -1,0 +1,22 @@
+{
+  "name": "wutheringai",
+  "owner": {
+    "name": "Wuthering AI",
+    "url": "https://wutheringai.com"
+  },
+  "description": "Skills and data tools published by Wuthering AI.",
+  "plugins": [
+    {
+      "name": "wuthering",
+      "source": "./",
+      "description": "Live market, competitor, advertising, app-store, company and web data, with the research methods that use it.",
+      "category": "research",
+      "keywords": [
+        "market-research",
+        "competitor-analysis",
+        "seo",
+        "ads"
+      ]
+    }
+  ]
+}

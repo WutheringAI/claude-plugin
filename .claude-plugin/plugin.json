@@ -1,0 +1,26 @@
+{
+  "name": "wuthering",
+  "displayName": "Wuthering AI",
+  "version": "0.1.0",
+  "description": "Live market, competitor, advertising, app-store, company and web data for agents, plus the research methods that decide which calls are worth making.",
+  "author": {
+    "name": "Wuthering AI",
+    "url": "https://wutheringai.com"
+  },
+  "homepage": "https://wutheringai.com",
+  "repository": "https://github.com/WutheringAI/claude-plugin",
+  "license": "MIT",
+  "keywords": [
+    "market-research",
+    "competitor-analysis",
+    "seo",
+    "keyword-research",
+    "ads",
+    "ad-library",
+    "reddit",
+    "linkedin",
+    "app-store",
+    "company-data",
+    "web-search"
+  ]
+}
