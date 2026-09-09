@@ -1,0 +1,4 @@
+# The desk-research skills are vendored from another repository. Left
+# counted, their scripts decide GitHub's language label for this one.
+skills/competitor-landscape/scripts/** linguist-vendored
+skills/serp-landscape/scripts/** linguist-vendored
