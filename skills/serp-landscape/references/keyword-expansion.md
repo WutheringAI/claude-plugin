@@ -112,19 +112,35 @@ at `--branch` nodes.
 Deeper layers can be too large to exhaust, so the order matters — and "worth
 expanding" is a different question from "good keyword". A long, highly specific
 query can be an excellent keyword and a dead end as a probe, because there is
-nothing left to append to it. Each node scores on five signals:
+nothing left to append to it.
 
-| signal | weight | why |
+The score is **headroom, and nothing else**: how much room the query has left to
+complete, measured in characters. It started as a five-part blend, which a real
+run's own data then graded — every node records what expanding it actually
+returned, so each ingredient could be correlated against realised yield over
+2,044 expanded nodes:
+
+| signal | weight it had | ρ vs. realised yield |
 |---|---|---|
-| `relevance` | 0.34 | Google's own `suggestrelevance` for the node |
-| `headroom` | 0.21 | short queries have room to complete; a 12-word one does not |
-| `corroboration` | 0.16 | returned by many different probes — a hub, not a leaf |
-| `parentage` | 0.15 | its parent probe was productive, so siblings likely are |
-| `rank` | 0.14 | where it sat in the suggestion list |
+| relevance | 0.34 | **+0.01** — near-constant: 33 distinct values, half of them 600 or 601 |
+| headroom | 0.21 | **+0.24** by words, **+0.33** by characters |
+| corroboration | 0.16 | −0.03 |
+| parentage | 0.15 | +0.17 |
+| rank | 0.14 | −0.05 |
+| *the blend* | — | **+0.10** — worse than headroom alone, by a factor of three |
 
-The score is written to each keyword as `expansion_score`, and the weights are
-copied into `search.ranking`, so the order a run chose can be audited rather
-than taken on trust.
+Three dead signals carrying 64% of the weight were dragging the ranking below
+what its best ingredient managed unaided. Characters beat words for the same
+idea because they have four times the resolution — 50 distinct values against
+12 — and ties fall back to the same ordering anyway.
+
+Re-graded across seven seeds after the change, ρ runs +0.21 to +0.36 on topics
+large enough for the order to matter, and the top score decile returns 3–9×
+what the bottom decile returns. Two caveats worth keeping: on a small topic
+every layer is exhausted anyway, so the ranking changes nothing there and its ρ
+is correspondingly weak; and 30–60% of expanded nodes return nothing at all in
+most corpora, so the honest prediction target is "any children at all" rather
+than how many.
 
 Ranked order alone would still dig one hole: the top 150 completions of one
 seed are mostly one phrasing, and so are their completions. So the ranked
@@ -237,6 +253,16 @@ either word: `--must-include "cold email"`. Values are comma-separated and all
 of them are required: `--must-include "claude,skills"`. Pass `--must-include -`
 to keep everything, which is occasionally right for a very broad seed and
 usually not.
+
+**When one token is doing all the rejecting**, the run says so. A conjunction is
+right when neither half of a compound seed names the topic alone ("ai harness"
+is a dog lead without both) and wrong when one token already names it:
+`cyanotype printing` demanding "printing" as well throws away "how cyanotype
+works" and "what is a cyanotype", and returns 424 keywords where the topic noun
+alone returns 5,000. Nothing lexical separates those two cases, so the expander
+measures instead — it counts the suggestions each token is *solely* responsible
+for rejecting, and when one token is doing most of it, names that token and the
+`--must-include` value that frees it.
 
 Dropped keywords are recorded with the reason in `keywords.json`. **When
 `dropped_off_topic` is large relative to what was kept**, read the dropped list

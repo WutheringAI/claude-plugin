@@ -360,36 +360,42 @@ def harvest(sug, sources, queries, workers=8):
 
 # ------------------------------------------------------------------ ranking
 
-# What the expansion score is made of, and why each part earns its weight.
-# Exposed in keywords.json as `expansion_score` so the order a run chose can be
-# audited rather than taken on trust.
-SCORE_WEIGHTS = {
-    "relevance": 0.34,      # Google's own suggestrelevance for the node
-    "rank": 0.14,           # where it sat in the suggestion list
-    "corroboration": 0.16,  # how many different probes returned it: a hub, not a leaf
-    "headroom": 0.21,       # short queries have room to complete; a 12-word one does not
-    "parentage": 0.15,      # its parent probe was productive, so siblings likely are
-}
+# One signal, because only one of them ever worked. A five-part blend --
+# relevance .34, headroom .21, corroboration .16, parentage .15, rank .14 --
+# was graded against what expanding each node actually returned, over 2,044
+# expanded nodes of a real run:
+#
+#   headroom       rho +0.33   (by characters; +0.24 by words)
+#   parentage      rho +0.17
+#   relevance      rho +0.01   <- the largest weight, and near-constant:
+#                                 33 distinct values, half of them 600 or 601
+#   corroboration  rho -0.03
+#   rank           rho -0.05
+#   the blend      rho +0.10   <- worse than headroom alone, by a factor of three
+#
+# Three dead signals carrying 64% of the weight were dragging the ranking below
+# what its best ingredient did unaided, so the blend is gone.
+SCORE_WEIGHTS = {"headroom": 1.0}
+
+# Where a query stops having room to complete. Queries in these corpora run
+# 12-85 characters; 100 puts the ceiling just past the longest real one, so the
+# score stays on an absolute scale and is comparable across layers and runs.
+HEADROOM_CEILING = 100.0
 
 
-def expansion_score(entry, max_relevance, parent_yield):
+def expansion_score(entry):
     """How much unexplored breadth probably sits under this keyword.
 
     Autocomplete completes a prefix, so expanding a node returns what people
     type *after* it. That makes "worth expanding" a different question from
     "important keyword": a long, highly specific query can be a fine keyword
-    and a dead end as a probe, because there is nothing left to append. The
-    score below is about breadth still available, not about the keyword's own
-    value -- which is why headroom carries almost as much weight as relevance.
+    and a dead end as a probe, because there is nothing left to append. This
+    measures only the room left, and measures it in characters rather than
+    words -- same idea, four times the resolution (50 distinct values against
+    12 on a real run), and a third more predictive for it.
     """
-    rel = (entry.get("relevance") or 0) / max_relevance if max_relevance else 0.0
-    rank = 1.0 / (1.0 + max(0, entry.get("rank") or 0))
-    corroboration = min(entry.get("seen_in_probes", 1), 5) / 5.0
-    headroom = max(0.0, (12 - entry.get("words", 1)) / 11.0)
-    w = SCORE_WEIGHTS
-    return round(w["relevance"] * rel + w["rank"] * rank
-                 + w["corroboration"] * corroboration + w["headroom"] * headroom
-                 + w["parentage"] * parent_yield, 4)
+    chars = entry.get("chars") or len(entry.get("keyword", ""))
+    return round(max(0.0, (HEADROOM_CEILING - chars) / HEADROOM_CEILING), 4)
 
 
 def order_frontier(entries, scores):
@@ -536,7 +542,7 @@ def main():
             return
         missing = [t for t, m in zip(required, matchers) if not m.search(key)]
         if missing:
-            dropped.append({"keyword": key, "probe": probe,
+            dropped.append({"keyword": key, "probe": probe, "missing": missing,
                             "reason": "drifted off-topic: missing %s"
                                       % ", ".join(repr(t) for t in missing)})
             return
@@ -606,6 +612,28 @@ def main():
     # to complete. Say so here rather than letting a one-keyword universe look
     # like a finding about demand.
     warnings = []
+
+    # The conjunction is right when neither half of a compound seed names the
+    # topic alone ("ai harness" is a dog lead without both). It is wrong when
+    # one token already names it: "cyanotype printing" demanding "printing" too
+    # throws away "how cyanotype works" and "what is a cyanotype", and a 10x
+    # smaller universe looks exactly like a small topic from the outside.
+    # Nothing lexical tells those two cases apart, so measure instead: count the
+    # suggestions a single token is solely responsible for rejecting, and if one
+    # token is doing most of the rejecting, name it and the flag that frees it.
+    if len(required) > 1:
+        solo = Counter(x["missing"][0] for x in dropped if len(x.get("missing", [])) == 1)
+        kept_now = max(1, len(keywords) - 1)
+        for token, n in solo.most_common(1):
+            if n >= max(30, 0.4 * kept_now):
+                keep = [t for t in required if t != token]
+                warnings.append(
+                    "the guard %s rejected %d layer-1 suggestions for missing %r "
+                    "alone, against %d kept. If %r is an attribute of the topic "
+                    "rather than the topic itself, it is costing recall for nothing "
+                    "-- rerun with --must-include %r to drop it."
+                    % (required, n, token, kept_now, token, ",".join(keep)))
+
     if len(keywords) - 1 < 40:
         # The head term is the first two *content* tokens, not the first two
         # words: "best claude skills for coding" heads to "claude skills", and
@@ -622,9 +650,10 @@ def main():
                 "asking a real query to repeat more of the seed than real "
                 "queries do -- widen it with --must-include, or shorten the seed."
                 % (len(dropped), len(keywords) - 1, required))
-        for w in warnings:
-            log("  WARNING: %s" % w, args.quiet)
         log("  (head term suggestion: %r)" % head, args.quiet)
+
+    for w in warnings:
+        log("  WARNING: %s" % w, args.quiet)
 
     # -- breadth-first from there ------------------------------------------
     # One layer at a time, and a layer is finished before the next one starts.
@@ -649,15 +678,9 @@ def main():
             log("layer %d: empty, nothing left to expand" % src_layer, args.quiet)
             break
 
-        max_rel = max((e.get("relevance") or 0) for e in frontier)
-        max_children = max([keywords[e["probe"]].get("children_found", 0)
-                            for e in frontier if e["probe"] in keywords] or [0])
         scores = {}
         for e in frontier:
-            parent = keywords.get(e["probe"])
-            parent_yield = ((parent.get("children_found", 0) / max_children)
-                            if parent and max_children else 1.0)
-            e["expansion_score"] = expansion_score(e, max_rel, parent_yield)
+            e["expansion_score"] = expansion_score(e)
             scores[e["keyword"]] = e["expansion_score"]
         order = order_frontier(frontier, scores)
 
