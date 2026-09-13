@@ -694,6 +694,12 @@ def main():
         else:
             if not exhaustive and spent < len(order):
                 stopped = "--branch cap of %d reached" % args.branch
+        # A layer whose last wave happened to be low-yield still explored every
+        # node it had. Reporting that as a yield stop understates the run --
+        # frontier_fully_explored is computed from these strings, so the
+        # mislabel turns a complete search into an apparently abandoned one.
+        if spent >= len(order) and stopped.startswith("yield"):
+            stopped = "layer exhausted"
 
         # "layer 3, from_layer 2, expanded 266 of a 266-node frontier" reads as
         # one sentence: which layer this produced, and how much of the layer
