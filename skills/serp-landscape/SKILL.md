@@ -36,7 +36,7 @@ across the pages is the answer to "what do I have to write".
 ```
 seed keyword
    |
-   v  expand_keywords.py   autocomplete, 3 levels deep -> ~5,000 keywords
+   v  expand_keywords.py   breadth-first over autocomplete -> ~5,000 keywords
    |                       grouped into ~600 topics, ~100 sampled for SERPs
    v  web search           the sampled keywords, 8-12 searches per turn
    v  record_serp.py       paste the results; it normalises and dedupes them
@@ -72,7 +72,7 @@ moving rather than interviewing the user:
   the run takes, because each one is a search call.
 - **Where output goes.** Default a new folder `<seed-slug>-serp/`.
 
-Then say what to expect: a few thousand keywords in about a minute, ~100
+Then say what to expect: a few thousand keywords in a minute or two, ~100
 searches over several turns, a few hundred pages read, two files at the end.
 
 ## Pipeline
@@ -92,11 +92,38 @@ python3 "$SKILL/scripts/expand_keywords.py" "<seed>" \
     --target 5000 --sample 100 --locale en-US --out "$OUT/keywords.json"
 ```
 
-Roughly 700 autocomplete calls, half a minute, no API key. Read the summary it
-prints before going further — `by_intent_prior` and the cluster labels tell you
-whether the seed meant what you thought. If `dropped_off_topic` is huge or the
-top clusters look like a different market, the seed was ambiguous: fix it now,
-because everything downstream inherits it.
+Roughly 1,000-2,000 autocomplete calls and one to two minutes for a 5,000
+keyword target, no API key. It is a **breadth-first search**: layer 1 is the
+seed through every probe shape and is always expanded in full, and each layer
+after it is ranked, expanded in waves, and finished before the next one starts.
+
+**Read the `layers` block in the summary before anything else.** It is the
+difference between a small topic and an abandoned search, and no other number
+in the run tells you which you got:
+
+```
+"layers": [
+  {"layer": 2, "discovered": 265, "expanded": "77 of 77 nodes in layer 1",
+   "stopped_because": "layer exhausted"},
+  {"layer": 5, "discovered": 1187, "expanded": "300 of 2680 nodes in layer 4",
+   "stopped_because": "target reached"}
+]
+```
+
+`layer exhausted` means that layer holds everything autocomplete will give;
+`target reached` means you stopped early and there is more there if you raise
+`--target`; `yield fell below --min-yield` means the tail stopped paying, which
+is a real finding about the topic's size. `frontier_fully_explored` is true
+only when every layer ended exhausted.
+
+**Then check `kept` against your `--target`.** Landing far short is a signal,
+not a detail: either the topic genuinely has less demand than you asked for, or
+the drift guard is throwing away the market. Compare `kept` with
+`dropped_off_topic` — more dropped than kept means the guard is wrong for this
+seed, and `--must-include` is how you fix it. Then read the rest of the
+summary: `by_intent_prior` and the cluster labels tell you whether the seed
+meant what you thought. If the top clusters look like a different market, the
+seed was ambiguous — fix it now, because everything downstream inherits it.
 
 **Then read `serp_targets.txt` before spending a single search on it.** A seed
 word with two lives pulls in real demand for a different subject — an "espresso
@@ -106,7 +133,8 @@ whole pipeline to catch that; after the searches are spent it costs a rerun.
 Strays that survive show up again in the digest as SERPs sharing nothing with
 the rest of the corpus, but by then you have paid for them.
 
-Raise `--target` and `--branch` freely for a bigger universe; add
+Raise `--target` freely for a bigger universe — the layers resize themselves to
+reach it, so it is the only knob you normally touch; add
 `--sources google,youtube` when the topic has a how-to or visual half, since
 YouTube autocomplete returns about 50% different phrasing. Full options and the
 non-English notes: **`references/keyword-expansion.md`**.
@@ -265,6 +293,19 @@ python3 "$SKILL/scripts/render_report.py" --analysis "$OUT/analysis.json" \
     --metrics "$OUT/metrics.json" --out "$OUT/<seed-slug>-serp.html"
 ```
 
+If you want the keyword universe as data rather than as a spreadsheet — to
+hand to another tool, or to keep every signal in one row per keyword — there is
+an export that joins the cluster in so demand mass is not a lookup away:
+
+```bash
+python3 "$SKILL/scripts/export_keywords.py" --keywords "$OUT/keywords.json" \
+    --metrics "$OUT/metrics.json" --out "$OUT/all_keywords.json" --csv "$OUT/all_keywords.csv"
+```
+
+It runs before the SERPs are captured too — `--metrics` is optional, and the
+output says `serp_metrics_joined: false` so nobody mistakes an unmeasured
+keyword for a measured one.
+
 The workbook carries Keywords (the whole universe), SERP results (one row per
 keyword per position, with the title Google showed, the title the page carries
 and its meta description), Pages, Domains, Clusters, Matrices, a **2x2 charts**
@@ -339,7 +380,11 @@ changes the picture.
 | Symptom | What to do |
 |---|---|
 | Seed has two meanings (autocomplete returns two markets) | Narrow the seed, rerun step 1, and say which meaning you took |
-| `dropped_off_topic` is huge | Autocomplete drifted; set `--must-include` to the token that defines the topic |
+| `dropped_off_topic` is bigger than `kept` | The drift guard is eating the market, not protecting it. Read `dropped` in `keywords.json`; if those keywords are on topic, widen with `--must-include` set to the words that really define the seed, or `-` to keep everything |
+| `kept` is far below `--target` | Read `layers[].stopped_because`. Every layer `layer exhausted` means the topic is genuinely that size — say so rather than implying you mapped 5,000. `yield fell below --min-yield` means the tail stopped paying; lower `--min-yield` to keep digging. Otherwise the guard is too tight (row above) |
+| You need more than the run gave you | Raise `--target` and re-run. `stopped_because: target reached` on the last layer means the frontier still had unexpanded nodes, so there is more there |
+| Adjacent topics in the universe | The guard requires every seed token already; tighten further to a phrase, `--must-include "cold email"` |
+| Layer 1 returns almost nothing, and the run warns about the seed | The seed is a question, not a keyword — autocomplete completes a *prefix*, and a six-word prefix has nothing to complete. Re-run on the head term the warning names (`best claude skills for X` -> `claude skills`); X comes back as a cluster with its demand attached |
 | Autocomplete returns almost nothing | The seed is too long or too rare — shorten it to the head term and let level 2 find the tail |
 | Search returns fewer than 5 results for many keywords | Those queries are too specific to map; note it and lean on the clusters that did resolve |
 | `coverage_pct` below 60 | Say so, `WebFetch` the top blocked pages, and keep unreadable pages off the medians |

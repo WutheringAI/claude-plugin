@@ -9,10 +9,14 @@ can trace is a guess wearing a number.
 
 Three things happen here:
 
-  1. EXPAND   probe autocomplete in waves -- seed, then question/commercial/
-              relation/alphabet shapes, then re-probe what came back, up to
-              --depth levels. Thousands of keywords for a few hundred cheap
-              API calls.
+  1. EXPAND   a breadth-first search over autocomplete. Layer 1 is the seed
+              put through every probe shape -- question, commercial, relation,
+              alphabet -- and it is always expanded in full, because it is the
+              breadth every deeper layer inherits. Each layer after it is
+              ranked by expansion_score, expanded in waves, and allowed to stop
+              where it stops paying. A layer is finished before the next one
+              begins, and keywords.json records each layer's frontier, how much
+              of it was expanded, and why it stopped.
   2. CLUSTER  group the universe by shared wording, so you know how much demand
               sits behind each topic rather than treating 4,000 keywords as
               4,000 separate problems.
@@ -29,8 +33,9 @@ Four sources, and they are not interchangeable:
 
 Usage:
     python3 expand_keywords.py "espresso machine" --out keywords.json
-    python3 expand_keywords.py "espresso machine" --target 10000 --branch 400 --sample 150
+    python3 expand_keywords.py "espresso machine" --target 10000 --sample 150
     python3 expand_keywords.py "cold email software" --sources google,youtube --locale en-GB
+    python3 expand_keywords.py "cold email software" --must-include "cold email"
 """
 
 import argparse
@@ -111,20 +116,123 @@ def tokens(text):
 
 
 def core_tokens(seed):
-    toks = [t for t in tokens(seed) if t not in STOP and len(t) > 2]
+    # Length is not a proxy for meaning. Dropping tokens under three characters
+    # throws away exactly the ones that define a modern seed -- ai, ml, ui, ux,
+    # vr, ev, 3d -- and "ai harness" then guards on "harness" alone, which is a
+    # dog lead, a safety belt and a horse race before it is anything about AI.
+    toks = [t for t in tokens(seed) if t not in STOP and len(t) > 1]
     return toks or tokens(seed)
 
 
-def anchor_token(seed):
-    """The token a drifted suggestion is least likely to keep by accident.
+# Head nouns that name the category rather than the subject. These are the
+# words autocomplete swaps most freely -- "cold email software" completes to
+# "cold email tool", "cold email platform", "cold email client" -- and they are
+# very often the longest word in the seed, so anchoring on length pins the
+# whole universe to the one token searchers vary most and throws the topic
+# away. Anchor on what is left of the seed instead.
+GENERIC_HEAD = set("""software tool tools app apps application applications platform platforms
+service services system systems solution solutions program programs suite suites product
+products machine machines device devices company companies vendor vendors provider providers
+agency agencies website websites site sites page pages online management manager taking maker
+makers builder builders generator generators tracker trackers checker checkers analyzer
+analyser dashboard portal engine engines""".split())
 
-    Autocomplete happily walks away from your seed -- "how espresso machine"
-    completes to "how coffee machine". Requiring the longest content token
-    catches that without discarding the legitimate long tail, which rarely
-    repeats every word of the seed.
+
+# Mass nouns have no plural, and "softwares" or "equipments" is ninety wasted
+# probes returning nothing. Only the heads likely to end a seed are listed.
+UNCOUNTABLE = set("""software hardware firmware middleware freeware shareware equipment
+furniture information advice research news music audio video content data media training
+maintenance insurance marketing advertising accounting consulting support hosting storage
+bandwidth traffic revenue analytics intelligence automation security compliance""".split())
+
+
+def singular(word):
+    """Drop a plural 's' where doing so is safe. '' when there is nothing to drop."""
+    if len(word) >= 4 and word.endswith("s") and not word.endswith(("ss", "us", "is", "os")):
+        return word[:-1]
+    return ""
+
+
+def seed_forms(seed):
+    """The seed and its singular/plural twin, both probed at layer 1.
+
+    Autocomplete is literal. "claude skill" and "claude skills" are the same
+    topic to a human and two different prefixes to the API, and a run seeded
+    with one explores a frontier the other never reaches: measured at 35%
+    overlap on a real run, each form finding ~2,900 keywords the other missed,
+    with every plural-only keyword passing the singular run's own guard. The
+    gap was never the filter -- it was that the probes only ever asked for one
+    form. So layer 1 asks for both, which costs about ninety extra calls and is
+    inherited by every layer below it.
+    """
+    toks = seed.split()
+    if not toks:
+        return [seed]
+    last = toks[-1]
+    twin = singular(last) or (last + "s" if len(last) >= 3 and not last.endswith("s")
+                              and last not in UNCOUNTABLE else "")
+    if not twin:
+        return [seed]
+    return [seed, " ".join(toks[:-1] + [twin])]
+
+
+def required_tokens(seed):
+    """The tokens a suggestion has to keep to still be about this topic.
+
+    Autocomplete happily walks away from your seed ("how espresso machine"
+    completes to "how coffee machine"), so a drift guard is worth having. The
+    guard has to hold onto what makes the seed *this* topic, which is the part
+    that is not the category noun: "espresso", not "machine"; "cold email", not
+    "software"; "ai harness", not "harness".
+
+    Every one of them has to survive, not just one. A compound seed is usually
+    compound because neither half means the topic on its own -- "ai" and
+    "harness" are each enormous and unrelated subjects, and a guard satisfied
+    by either fills the universe with dog leads and horse racing. Requiring all
+    of them costs some legitimate tail ("cold outreach tools" under a "cold
+    email software" seed) and buys precision, which is the better trade when
+    the sample downstream costs a web search per keyword.
+
+    A seed that is nothing but category nouns ("project management software")
+    falls back to its own content tokens, because some guard beats none.
+
+    The conjunction is capped at three tokens. Past that the filter asks a real
+    query to repeat more of the seed than real queries do -- "best claude
+    skills for data analysis" would demand claude AND skills AND data AND
+    analysis, and drop "claude skills for data science" for the last one. A
+    seed that long is over-specified anyway, and expand_keywords warns about it
+    separately rather than silently returning nothing.
     """
     toks = core_tokens(seed)
-    return max(toks, key=len) if toks else seed.lower()
+    distinctive = [t for t in toks if t not in GENERIC_HEAD]
+    picked = (distinctive or toks or [seed.lower()])[:3]
+    # Stem the plural so a "claude skills" seed guards identically to a
+    # "claude skill" one -- prefix matching then covers both forms, and the two
+    # seeds stop producing two different universes of the same topic. Only the
+    # seed-derived set is stemmed; an explicit --must-include is taken literally.
+    return [singular(t) or t for t in picked]
+
+
+def token_matchers(required):
+    """Match each token as a word, loosening only where it is safe to.
+
+    Three rules, and the length is what picks between them, because the risk
+    runs the opposite way at each end:
+
+      <= 3 chars   whole word only -- "ai" must not match training, and once
+                   anchored to a word start it must not match airtag, aircraft
+                   or airlift either, which is most of what an "ai harness"
+                   universe fills up with otherwise
+      >= 4 chars   word prefix -- long tokens are safe to loosen, and the
+                   morphology is worth having: "email" catches emailing and
+                   emails, "harness" catches harnesses and harnessing
+      phrases      as written, at a word start ("cold email" -> cold emailing)
+    """
+    out = []
+    for t in required:
+        stem = re.escape(t)
+        out.append(re.compile(r"\b%s\b" % stem if len(t) <= 3 else r"\b%s" % stem))
+    return out
 
 
 def intent_prior(keyword):
@@ -213,18 +321,25 @@ class Suggest:
 
 
 def seed_probes(seed, letters=True, digits=False):
-    """Prefixes to complete at level 1. Order matters: the plain seed first,
-    then the modifier families, then the alphabet -- so a run cut short still
-    has the high-value shapes rather than 'seed a' through 'seed f'."""
-    out = [seed]
-    out += ["%s %s" % (w, seed) for w in QUESTION_WORDS]
-    out += ["%s %s" % (seed, w) for w in COMMERCIAL_WORDS]
-    out += ["%s %s" % (w, seed) for w in ("best", "top", "cheap", "free", "buy")]
-    out += ["%s %s" % (seed, w) for w in RELATION_WORDS]
-    if letters:
-        out += ["%s %s" % (seed, c) for c in LETTERS]
-    if digits:
-        out += ["%s %s" % (seed, d) for d in "0123456789"]
+    """Prefixes to complete at layer 1.
+
+    Every form of the seed gets the full shape treatment, and the order matters
+    twice over: the plain seeds first, then the modifier families, then the
+    alphabet, and within each the given seed before its twin -- so a run cut
+    short still has the high-value shapes of the form the user actually asked
+    for, rather than 'seed a' through 'seed f'.
+    """
+    forms = seed_forms(seed)
+    out = list(forms)
+    for shapes, template in (
+            (QUESTION_WORDS, "%(w)s %(s)s"),
+            (COMMERCIAL_WORDS, "%(s)s %(w)s"),
+            (("best", "top", "cheap", "free", "buy"), "%(w)s %(s)s"),
+            (RELATION_WORDS, "%(s)s %(w)s"),
+            (LETTERS if letters else (), "%(s)s %(w)s"),
+            ("0123456789" if digits else (), "%(s)s %(w)s")):
+        for w in shapes:
+            out += [template % {"w": w, "s": s} for s in forms]
     return list(dict.fromkeys(out))
 
 
@@ -243,26 +358,68 @@ def harvest(sug, sources, queries, workers=8):
     return out
 
 
-def pick_branches(pool, limit):
-    """Choose which keywords to dig under.
+# ------------------------------------------------------------------ ranking
 
-    Ranking by relevance alone digs the same hole deeper: the top 150
-    completions of one seed are mostly one phrasing. Rotating through distinct
-    modifier shapes spends the same budget across the market instead.
+# One signal, because only one of them ever worked. A five-part blend --
+# relevance .34, headroom .21, corroboration .16, parentage .15, rank .14 --
+# was graded against what expanding each node actually returned, over 2,044
+# expanded nodes of a real run:
+#
+#   headroom       rho +0.33   (by characters; +0.24 by words)
+#   parentage      rho +0.17
+#   relevance      rho +0.01   <- the largest weight, and near-constant:
+#                                 33 distinct values, half of them 600 or 601
+#   corroboration  rho -0.03
+#   rank           rho -0.05
+#   the blend      rho +0.10   <- worse than headroom alone, by a factor of three
+#
+# Three dead signals carrying 64% of the weight were dragging the ranking below
+# what its best ingredient did unaided, so the blend is gone.
+SCORE_WEIGHTS = {"headroom": 1.0}
+
+# Where a query stops having room to complete. Queries in these corpora run
+# 12-85 characters; 100 puts the ceiling just past the longest real one, so the
+# score stays on an absolute scale and is comparable across layers and runs.
+HEADROOM_CEILING = 100.0
+
+
+def expansion_score(entry):
+    """How much unexplored breadth probably sits under this keyword.
+
+    Autocomplete completes a prefix, so expanding a node returns what people
+    type *after* it. That makes "worth expanding" a different question from
+    "important keyword": a long, highly specific query can be a fine keyword
+    and a dead end as a probe, because there is nothing left to append. This
+    measures only the room left, and measures it in characters rather than
+    words -- same idea, four times the resolution (50 distinct values against
+    12 on a real run), and a third more predictive for it.
+    """
+    chars = entry.get("chars") or len(entry.get("keyword", ""))
+    return round(max(0.0, (HEADROOM_CEILING - chars) / HEADROOM_CEILING), 4)
+
+
+def order_frontier(entries, scores):
+    """Rank a whole layer for expansion, without digging one hole.
+
+    Score order alone would expand fifty phrasings of one sub-topic before
+    touching another, so a layer cut short would come back lopsided. Bucketing
+    by each node's leading modifier and rotating through the buckets -- best
+    node from each, biggest bucket first -- spends the layer across the market
+    instead. A layer expanded to exhaustion ends up with the same set either
+    way; this only decides the order, which is what matters when a deeper layer
+    stops early.
     """
     buckets = defaultdict(list)
-    for k in sorted(pool, key=lambda k: (-(k["relevance"] or 0), k["rank"], k["chars"])):
-        buckets[k["modifiers"][0] if k["modifiers"] else "_seed"].append(k)
-    picked, exhausted = [], False
-    while len(picked) < limit and not exhausted:
-        exhausted = True
-        for shape in sorted(buckets, key=lambda s: -len(buckets[s])):
+    for e in sorted(entries, key=lambda e: (-scores.get(e["keyword"], 0.0), e["chars"])):
+        buckets[e["modifiers"][0] if e["modifiers"] else "_seed"].append(e)
+    order = []
+    while True:
+        live = [s for s in buckets if buckets[s]]
+        if not live:
+            return order
+        for shape in sorted(live, key=lambda s: -len(buckets[s])):
             if buckets[shape]:
-                picked.append(buckets[shape].pop(0)["keyword"])
-                exhausted = False
-                if len(picked) >= limit:
-                    break
-    return picked
+                order.append(buckets[shape].pop(0)["keyword"])
 
 
 # ---------------------------------------------------------------- clustering
@@ -328,17 +485,29 @@ def main():
     ap.add_argument("--locale", default="en-US", help="language-REGION, e.g. en-GB, de-DE")
     ap.add_argument("--sources", default="google",
                     help="comma-separated: google,youtube,ddg,bing (default google)")
-    ap.add_argument("--depth", type=int, default=3,
-                    help="1 = probes on the seed only; 2-3 re-probe what came back (default 3)")
-    ap.add_argument("--branch", type=int, default=150,
-                    help="keywords re-probed at each deeper level (default 150)")
+    ap.add_argument("--depth", type=int, default=6,
+                    help="deepest layer to reach (default 6). 1 is the seed's own probes and "
+                         "nothing else. Layers stop early once --target is met or the frontier "
+                         "runs dry, so this is a ceiling rather than a plan")
+    ap.add_argument("--branch", type=int, default=1500,
+                    help="most nodes expanded in any one layer BELOW layer 1 (default 1500). "
+                         "Layer 1 is always expanded in full, because it is the breadth every "
+                         "deeper layer inherits")
+    ap.add_argument("--wave", type=int, default=150,
+                    help="nodes probed per wave inside a layer (default 150). Yield is measured "
+                         "per wave, so this is the granularity at which a layer can stop early")
+    ap.add_argument("--min-yield", type=float, default=0.6,
+                    help="new keywords per probe below which a layer below layer 1 stops "
+                         "(default 0.6). Lower it to keep digging a thin topic")
     ap.add_argument("--extra", default="",
                     help="comma-separated keywords you found elsewhere (related searches, "
                          "People Also Ask); kept verbatim with source=manual")
     ap.add_argument("--extra-file", help="file with one such keyword per line")
     ap.add_argument("--must-include", default="",
-                    help="token every keyword must contain (default: longest seed token). "
-                         "Pass '-' to keep everything autocomplete returns.")
+                    help="comma-separated tokens; a keyword is kept if it contains any one of "
+                         "them (default: the seed's own tokens minus category nouns like "
+                         "'software' or 'platform'). Pass '-' to keep everything autocomplete "
+                         "returns.")
     ap.add_argument("--df-ceiling", type=float, default=0.05,
                     help="a word used by more than this share of the universe cannot anchor a "
                          "topic (default 0.05) -- it stops a near-synonym of the seed from "
@@ -355,7 +524,13 @@ def main():
     sources = [s.strip() for s in args.sources.split(",") if s.strip() in ENDPOINTS]
     if not sources:
         raise SystemExit("no valid --sources; choose from %s" % ", ".join(ENDPOINTS))
-    required = "" if args.must_include == "-" else (norm(args.must_include) or anchor_token(seed))
+    if args.must_include == "-":
+        required = []
+    elif args.must_include.strip():
+        required = [norm(t) for t in args.must_include.split(",") if norm(t)]
+    else:
+        required = required_tokens(seed)
+    matchers = token_matchers(required)
 
     sug = Suggest(args.locale, args.delay)
     keywords, dropped = {}, []
@@ -365,9 +540,11 @@ def main():
         key = norm(text)
         if not key or (key == seed and level > 0):
             return
-        if required and required not in key:
-            dropped.append({"keyword": key, "probe": probe,
-                            "reason": "drifted off-topic: missing %r" % required})
+        missing = [t for t, m in zip(required, matchers) if not m.search(key)]
+        if missing:
+            dropped.append({"keyword": key, "probe": probe, "missing": missing,
+                            "reason": "drifted off-topic: missing %s"
+                                      % ", ".join(repr(t) for t in missing)})
             return
         if len(key) > 140 or len(key.split()) > 14:
             dropped.append({"keyword": key, "probe": probe, "reason": "too long to be a query"})
@@ -375,7 +552,9 @@ def main():
         prior = keywords.get(key)
         if prior:
             prior["seen_in_probes"] += 1
-            # The earliest, highest-ranked sighting is the honest provenance.
+            # Breadth-first, so the first sighting is the shallowest one and the
+            # layer a keyword is filed under is its true distance from the seed.
+            # Only a better rank within the same layer can revise the provenance.
             if (level, rank) < (prior["level"], prior["rank"]):
                 prior.update(level=level, source=source, probe=probe, rank=rank)
             if relevance and (prior.get("relevance") or 0) < relevance:
@@ -388,35 +567,177 @@ def main():
             "modifiers": modifiers(key, seed_tokens), "intent_prior": intent_prior(key),
             "is_question": bool(re.match(r"^(how|what|why|when|which|where|who|is|are|can|"
                                          r"does|do|should|will)\b", key)),
+            # BFS bookkeeping: was this node itself expanded, what did expanding
+            # it return, and what did the ranking think of it beforehand.
+            "expanded": False, "children_found": 0, "expansion_score": None,
         }
 
     add(seed, 0, "seed", "seed", 0, None)
 
-    # -- level 1 -----------------------------------------------------------
+    def expand(queries, layer, layers_seen):
+        """Probe a set of queries and file everything they return into `layer`.
+
+        Returns how many keywords were new, and credits each probed node with
+        the children it produced, which is what `parentage` scores next layer.
+        """
+        gained = 0
+        for source, probe, hits in harvest(sug, sources, queries, args.workers):
+            before = len(keywords)
+            for text, rank, rel in hits:
+                add(text, layer, "%s:suggest" % source, probe, rank, rel)
+            found = len(keywords) - before
+            gained += found
+            node = keywords.get(probe)
+            if node is not None:
+                node["children_found"] = node.get("children_found", 0) + found
+                node["expanded"] = True
+        layers_seen.update(queries)
+        return gained
+
+    # -- layer 1: complete the seed's own frontier --------------------------
     wave = seed_probes(seed, letters=not args.no_letters, digits=args.digits)
-    log("level 1: %d probes x %d source(s)" % (len(wave), len(sources)), args.quiet)
-    for source, probe, hits in harvest(sug, sources, wave, args.workers):
-        for text, rank, rel in hits:
-            add(text, 1, "%s:suggest" % source, probe, rank, rel)
+    log("layer 1: %d seed probes x %d source(s)" % (len(wave), len(sources)), args.quiet)
+    probed = {seed}
+    t_layer = time.time()
+    expand(wave, 1, probed)
+    layers = [{"layer": 1, "from_layer": 0, "discovered": len(keywords) - 1,
+               "frontier": 1, "expanded": 1,
+               "probes": len(wave) * len(sources), "policy": "exhaustive",
+               "stopped_because": "seed probe shapes exhausted",
+               "seconds": round(time.time() - t_layer, 1)}]
     log("  -> %d keywords (%.0fs)" % (len(keywords), time.time() - t0), args.quiet)
 
-    # -- deeper levels: re-probe what came back ----------------------------
-    # This is where "going deeper" happens. A level-1 keyword is already a real
-    # query; completing it again returns the specific, lower-competition tail
-    # that never appears when you only ever complete the seed.
-    for level in range(2, max(2, args.depth + 1)):
-        if len(keywords) >= args.target * 4:
-            log("level %d: skipped, universe already %d" % (level, len(keywords)), args.quiet)
+    # A layer 1 this thin is not a small market, it is the wrong kind of seed:
+    # autocomplete completes a prefix, and a six-word prefix has almost nothing
+    # to complete. Say so here rather than letting a one-keyword universe look
+    # like a finding about demand.
+    warnings = []
+
+    # The conjunction is right when neither half of a compound seed names the
+    # topic alone ("ai harness" is a dog lead without both). It is wrong when
+    # one token already names it: "cyanotype printing" demanding "printing" too
+    # throws away "how cyanotype works" and "what is a cyanotype", and a 10x
+    # smaller universe looks exactly like a small topic from the outside.
+    # Nothing lexical tells those two cases apart, so measure instead: count the
+    # suggestions a single token is solely responsible for rejecting, and if one
+    # token is doing most of the rejecting, name it and the flag that frees it.
+    if len(required) > 1:
+        solo = Counter(x["missing"][0] for x in dropped if len(x.get("missing", [])) == 1)
+        kept_now = max(1, len(keywords) - 1)
+        for token, n in solo.most_common(1):
+            if n >= max(30, 0.4 * kept_now):
+                keep = [t for t in required if t != token]
+                warnings.append(
+                    "the guard %s rejected %d layer-1 suggestions for missing %r "
+                    "alone, against %d kept. If %r is an attribute of the topic "
+                    "rather than the topic itself, it is costing recall for nothing "
+                    "-- rerun with --must-include %r to drop it."
+                    % (required, n, token, kept_now, token, ",".join(keep)))
+
+    if len(keywords) - 1 < 40:
+        # The head term is the first two *content* tokens, not the first two
+        # words: "best claude skills for coding" heads to "claude skills", and
+        # suggesting "best claude" would send the rerun somewhere useless.
+        head = " ".join(core_tokens(seed)[:2])
+        warnings.append(
+            "layer 1 returned only %d keywords from %d probes. A seed this "
+            "specific has almost nothing to complete -- try the head term "
+            "(\"%s\") and let the deeper layers find this niche as a cluster."
+            % (len(keywords) - 1, len(wave), head))
+        if len(dropped) > 3 * max(1, len(keywords) - 1):
+            warnings.append(
+                "%d suggestions were dropped against %d kept. The guard %s is "
+                "asking a real query to repeat more of the seed than real "
+                "queries do -- widen it with --must-include, or shorten the seed."
+                % (len(dropped), len(keywords) - 1, required))
+        log("  (head term suggestion: %r)" % head, args.quiet)
+
+    for w in warnings:
+        log("  WARNING: %s" % w, args.quiet)
+
+    # -- breadth-first from there ------------------------------------------
+    # One layer at a time, and a layer is finished before the next one starts.
+    # That ordering is the point: a keyword two completions from the seed is a
+    # different kind of query from one five completions out, and mixing them
+    # means a run cut short has explored neither properly. Layer 1 is always
+    # expanded to exhaustion, because it is the breadth every later layer
+    # inherits -- leave a layer-1 node unprobed and the whole subtree under it
+    # is missing from the universe with nothing to show that it ever existed.
+    #
+    # Deeper layers are ranked by expansion_score and expanded in waves, so a
+    # layer can stop where it stops paying rather than at a fixed budget. What
+    # a layer did, and why it stopped, is recorded in `layers` for audit.
+    for src_layer in range(1, max(1, args.depth)):
+        if len(keywords) >= args.target:
+            log("layer %d: not expanded, universe already at target (%d)"
+                % (src_layer, len(keywords)), args.quiet)
             break
-        parents = [k for k in keywords.values() if k["level"] == level - 1]
-        if not parents:
+        frontier = [k for k in keywords.values()
+                    if k["level"] == src_layer and k["keyword"] not in probed]
+        if not frontier:
+            log("layer %d: empty, nothing left to expand" % src_layer, args.quiet)
             break
-        branches = pick_branches(parents, args.branch)
-        log("level %d: re-probing %d keywords" % (level, len(branches)), args.quiet)
-        for source, probe, hits in harvest(sug, sources[:1], branches, args.workers):
-            for text, rank, rel in hits:
-                add(text, level, "%s:suggest" % source, probe, rank, rel)
-        log("  -> %d keywords (%.0fs)" % (len(keywords), time.time() - t0), args.quiet)
+
+        scores = {}
+        for e in frontier:
+            e["expansion_score"] = expansion_score(e)
+            scores[e["keyword"]] = e["expansion_score"]
+        order = order_frontier(frontier, scores)
+
+        # Layer 1 is exhaustive by design. A deeper layer gets its whole frontier
+        # ranked and then spends up to --branch of it, stopping sooner when the
+        # wave loop below sees --target met or the yield collapse.
+        exhaustive = src_layer == 1
+        budget = len(order) if exhaustive else min(len(order), args.branch)
+        t_layer, spent, gained_total = time.time(), 0, 0
+        stopped = "layer exhausted"
+        log("layer %d -> %d: %d nodes on the frontier, expanding %s"
+            % (src_layer, src_layer + 1, len(order),
+               "all of them" if exhaustive else "up to %d" % budget), args.quiet)
+
+        while spent < budget:
+            if len(keywords) >= args.target:
+                stopped = "target reached"
+                break
+            # Clamped to the budget, not just sized by --wave: an unclamped
+            # final wave overshoots a --branch cap by up to a whole wave.
+            chunk = order[spent: min(spent + args.wave, budget)]
+            gained = expand(chunk, src_layer + 1, probed)
+            spent += len(chunk)
+            gained_total += gained
+            rate = gained / float(len(chunk))
+            log("    %d/%d probed, +%d (%.1f new per probe), %d keywords (%.0fs)"
+                % (spent, budget, gained, rate, len(keywords), time.time() - t0), args.quiet)
+            # A topic with 800 real queries in it should not grind through every
+            # remaining node to prove it -- but only a deeper layer may give up,
+            # because layer 1 decides the breadth of everything below it.
+            if not exhaustive and rate < args.min_yield:
+                stopped = "yield %.1f fell below --min-yield %.1f" % (rate, args.min_yield)
+                break
+        else:
+            if not exhaustive and spent < len(order):
+                stopped = "--branch cap of %d reached" % args.branch
+        # A layer whose last wave happened to be low-yield still explored every
+        # node it had. Reporting that as a yield stop understates the run --
+        # frontier_fully_explored is computed from these strings, so the
+        # mislabel turns a complete search into an apparently abandoned one.
+        if spent >= len(order) and stopped.startswith("yield"):
+            stopped = "layer exhausted"
+
+        # "layer 3, from_layer 2, expanded 266 of a 266-node frontier" reads as
+        # one sentence: which layer this produced, and how much of the layer
+        # below it was opened to produce it.
+        layers.append({"layer": src_layer + 1, "from_layer": src_layer,
+                       "discovered": gained_total,
+                       "frontier": len(order), "expanded": spent,
+                       "probes": spent * len(sources),
+                       # the rule the layer ran under; stopped_because is what
+                       # actually happened, and a ranked layer may still exhaust
+                       "policy": "exhaustive" if exhaustive else "ranked",
+                       "stopped_because": stopped,
+                       "seconds": round(time.time() - t_layer, 1)})
+        log("  layer %d done: +%d keywords from %d nodes (%s)"
+            % (src_layer + 1, gained_total, spent, stopped), args.quiet)
 
     # -- keywords you brought yourself -------------------------------------
     manual = [k.strip() for k in args.extra.split(",") if k.strip()]
@@ -432,15 +753,18 @@ def main():
                          "rank": 0, "relevance": None, "seen_in_probes": 1,
                          "words": len(key.split()), "chars": len(key),
                          "modifiers": modifiers(key, seed_tokens), "intent_prior": intent_prior(key),
-                         "is_question": False}
+                         "is_question": False,
+                         "expanded": False, "children_found": 0, "expansion_score": None}
 
     # -- trim to --target, keeping the depth ------------------------------
-    # Sorting by level would put every deep keyword last and a target smaller
+    # Sorting by layer would put every deep keyword last and a target smaller
     # than the universe would then quietly throw away the whole point of
-    # digging. Quotas keep each level's share of the set.
+    # digging. Quotas keep each layer's share of the set -- and layer 1 is kept
+    # whole, because it was expanded exhaustively to establish the breadth and
+    # trimming it would throw that away at the last step.
     pool = list(keywords.values())
     if len(pool) > args.target:
-        share = {0: 1.0, 1: 0.40, 2: 0.35, 3: 0.25, 4: 0.15}
+        share = {0: 1.0, 1: 1.0, 2: 0.35, 3: 0.25, 4: 0.20, 5: 0.15}
         by_level = defaultdict(list)
         for k in pool:
             by_level[k["level"]].append(k)
@@ -504,11 +828,27 @@ def main():
         by_intent[k["intent_prior"]] += 1
         by_level_count[k["level"]] += 1
 
+    # Every layer's frontier size, how much of it was expanded, and why it
+    # stopped. This is the record that says whether a short universe means the
+    # topic is small or means the search gave up -- which is the difference
+    # between a finding and a gap.
+    complete = all(ly.get("stopped_because") in ("layer exhausted",
+                                                 "seed probe shapes exhausted")
+                   for ly in layers)
     payload = {
         "seed": seed, "locale": args.locale, "sources": sources, "depth": args.depth,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        # must_include is the token set; a keyword holding any one of them was kept.
         "target": args.target, "sample_size": len(sample), "must_include": required or None,
         "api_calls": sug.calls, "elapsed_seconds": round(time.time() - t0, 1),
+        "search": {"strategy": "breadth-first",
+                   "ranking": SCORE_WEIGHTS,
+                   "layer1_exhaustive": True,
+                   "min_yield": args.min_yield, "wave": args.wave,
+                   "warnings": warnings,
+                   "branch_cap": args.branch,
+                   "frontier_fully_explored": complete,
+                   "layers": layers},
         "stats": {"discovered": len(keywords), "kept": len(pool),
                   "clusters": len(clusters), "dropped_off_topic": len(dropped),
                   "by_level": dict(sorted(by_level_count.items())),
@@ -537,6 +877,14 @@ def main():
                       "by_level": payload["stats"]["by_level"],
                       "by_intent_prior": payload["stats"]["by_intent_prior"],
                       "dropped_off_topic": len(dropped),
+                      "warnings": warnings,
+                      "frontier_fully_explored": complete,
+                      "layers": [{"layer": ly["layer"], "discovered": ly["discovered"],
+                                  "expanded": "%s of %s nodes in layer %s"
+                                              % (ly["expanded"], ly["frontier"],
+                                                 ly["from_layer"]),
+                                  "stopped_because": ly["stopped_because"]}
+                                 for ly in layers],
                       "probe_failures": len(sug.failures)}, indent=2))
 
 
