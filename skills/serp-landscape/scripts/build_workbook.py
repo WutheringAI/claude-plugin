@@ -317,6 +317,10 @@ def build(metrics, keywords, serp, analysis, out_path):
     # -- Keywords: the whole universe, not just the sampled ones -----------
     headers = ["keyword", "level", "topic", "topic_size", "source", "found_via_probe",
                "suggest_rank", "suggest_relevance", "words", "is_question", "intent_prior",
+               # how the breadth-first search treated this node: whether it was
+               # itself expanded, what that returned, and what the ranking
+               # thought of it beforehand
+               "expanded", "children_found", "expansion_score",
                "serp_captured", "serp_intent", "intent_agrees", "serp_cluster",
                "demand_mass", "results", "readable_results", "coverage_pct",
                "distinct_domains", "incumbent_share", "median_word_count",
@@ -331,6 +335,8 @@ def build(metrics, keywords, serp, analysis, out_path):
             topic_size.get(k.get("cluster", ""), ""), k.get("source", ""), k.get("probe", ""),
             k.get("rank", ""), k.get("relevance", ""), k.get("words", ""),
             k.get("is_question", False), k.get("intent_prior", ""),
+            k.get("expanded", False), k.get("children_found", ""),
+            k.get("expansion_score", ""),
             bool(m), m.get("serp_intent", ""), m.get("intent_agrees", "") if m else "",
             m.get("serp_cluster", ""), m.get("demand_mass", ""), m.get("results", ""),
             m.get("readable_results", ""), m.get("coverage_pct", ""),

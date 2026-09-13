@@ -293,6 +293,19 @@ python3 "$SKILL/scripts/render_report.py" --analysis "$OUT/analysis.json" \
     --metrics "$OUT/metrics.json" --out "$OUT/<seed-slug>-serp.html"
 ```
 
+If you want the keyword universe as data rather than as a spreadsheet — to
+hand to another tool, or to keep every signal in one row per keyword — there is
+an export that joins the cluster in so demand mass is not a lookup away:
+
+```bash
+python3 "$SKILL/scripts/export_keywords.py" --keywords "$OUT/keywords.json" \
+    --metrics "$OUT/metrics.json" --out "$OUT/all_keywords.json" --csv "$OUT/all_keywords.csv"
+```
+
+It runs before the SERPs are captured too — `--metrics` is optional, and the
+output says `serp_metrics_joined: false` so nobody mistakes an unmeasured
+keyword for a measured one.
+
 The workbook carries Keywords (the whole universe), SERP results (one row per
 keyword per position, with the title Google showed, the title the page carries
 and its meta description), Pages, Domains, Clusters, Matrices, a **2x2 charts**
