@@ -12,7 +12,7 @@ expansion has gone somewhere you did not intend.
 - [Going deeper: a breadth-first search](#going-deeper-a-breadth-first-search)
 - [Topics and demand mass](#topics-and-demand-mass)
 - [Choosing the SERP sample](#choosing-the-serp-sample)
-- [Drift, and the token that stops it](#drift-and-the-token-that-stops-it)
+- [Drift, and the tokens that stop it](#drift-and-the-tokens-that-stop-it)
 - [Locales and non-English seeds](#locales-and-non-english-seeds)
 - [Flags worth knowing](#flags-worth-knowing)
 
@@ -178,20 +178,17 @@ piling ten of them on ten phrasings of one question. In a 4,891-keyword run a
 The seed itself is always in the sample. Each sampled keyword carries its
 topic's size, so a dot on the map can be weighted by what stands behind it.
 
-## Drift, and the token that stops it
+## Drift, and the tokens that stop it
 
 Autocomplete walks away from your seed given half a chance: `how espresso
 machine` completes to `how coffee machine`, and `a espresso machine` to `a
 coffee machine game`. Left alone, a few hundred off-topic keywords enter the
 universe and every downstream number is diluted.
 
-The filter is a small set of tokens, and a keyword is kept if it contains any
-one of them. By default the set is the seed's own content words **minus the
-category noun** — the `software`, `platform`, `tool`, `app`, `machine` half of
-the seed. For "espresso machine" that leaves `espresso`, which keeps "best
-espresso machine under $500" and drops "coffee machine game". For "cold email
-software" it leaves `cold, email`, which keeps "cold email templates" and "cold
-outreach tools" and drops "ai noise cancelling software".
+The filter is a small set of tokens, and **every one of them has to survive**.
+The set is the seed's own content words minus the category noun — the
+`software`, `platform`, `tool`, `app`, `machine` half of the seed — capped at
+three.
 
 Dropping the category noun matters more than it looks. It is usually the
 longest word in the seed and always the word searchers vary most freely —
@@ -200,16 +197,35 @@ platform", "cold email client" — so requiring it pins the universe to the one
 token the market does not agree on. Requiring it discarded about three
 quarters of that seed's real demand.
 
-Because the default set is deliberately permissive, adjacent topics do get in:
-requiring `cold` *or* `email` admits some general email-marketing queries.
-That is the trade, and it is the cheaper mistake — clustering separates them,
-and the sample review in step 2 of the skill is there to catch the rest.
+Requiring *all* of what is left, rather than any one, matters just as much. A
+compound seed is usually compound because neither half names the topic alone:
+"ai" and "harness" are each enormous and unrelated subjects, and a guard
+satisfied by either fills the universe with dog leads, safety belts, wiring
+looms and horse racing. On a real "ai harness" run that was 82% of the output.
 
-Tighten it with a phrase when a seed's meaning lives in the pair rather than
-either word: `--must-include "cold email"` (substring matching, so it still
-catches "cold emailing"). Comma-separated values are alternatives, not
-requirements: `--must-include "crm,pipeline"`. Pass `--must-include -` to keep
-everything, which is occasionally right for a very broad seed and usually not.
+Tokens are matched as words, and the length picks how loosely:
+
+| token | matched as | so it catches | and not |
+|---|---|---|---|
+| `ai`, `ml`, `3d` (≤3 chars) | whole word | "harness for ai agents" | training, airtag, aircraft, airlift |
+| `email`, `harness` (≥4) | word prefix | emailing, emails, harnesses | — |
+| `"cold email"` (phrase) | phrase at a word start | "cold emailing" | — |
+
+Short tokens have to be whole words in both directions. Plain substring lets
+`ai` match *tr**ai**n* and *em**ail***; anchoring only the front still lets it
+match *ai*rtag and *ai*rcraft, which is most of what an "ai harness" universe
+fills up with otherwise.
+
+The conjunction is capped at three tokens because past that it asks a real
+query to repeat more of the seed than real queries do. "best claude skills for
+data analysis" would demand claude AND skills AND data AND analysis, and drop
+"claude skills for data science" for the last one.
+
+Tighten with a phrase when a seed's meaning lives in the pair rather than
+either word: `--must-include "cold email"`. Values are comma-separated and all
+of them are required: `--must-include "claude,skills"`. Pass `--must-include -`
+to keep everything, which is occasionally right for a very broad seed and
+usually not.
 
 Dropped keywords are recorded with the reason in `keywords.json`. **When
 `dropped_off_topic` is large relative to what was kept**, read the dropped list
@@ -241,7 +257,7 @@ US rankings is two datasets pretending to be one.
 | `--min-yield F` | New keywords per probe below which a layer below layer 1 stops, default 0.6. Lower it to keep digging a thin topic |
 | `--sources` | `google,youtube` when the topic has a how-to half |
 | `--locale` | Autocomplete is locale-specific; match it to the market |
-| `--must-include` | The drift guard. Set it to a phrase (`"cold email"`) when the default token set lets adjacent topics in |
+| `--must-include` | The drift guard, comma-separated and all required. A phrase (`"cold email"`) tightens; fewer tokens, or `-`, widens |
 | `--df-ceiling` | Lower it (0.03) if a near-synonym of the seed is swallowing topics |
 | `--extra` / `--extra-file` | Keywords you found elsewhere — related searches, People Also Ask, the user's own list. Kept verbatim with `source: manual` |
 | `--no-letters` | Skips the a-z round: ~25% fewer calls, noticeably less tail |

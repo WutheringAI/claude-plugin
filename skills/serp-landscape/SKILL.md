@@ -370,7 +370,8 @@ changes the picture.
 | `dropped_off_topic` is bigger than `kept` | The drift guard is eating the market, not protecting it. Read `dropped` in `keywords.json`; if those keywords are on topic, widen with `--must-include` set to the words that really define the seed, or `-` to keep everything |
 | `kept` is far below `--target` | Read `layers[].stopped_because`. Every layer `layer exhausted` means the topic is genuinely that size — say so rather than implying you mapped 5,000. `yield fell below --min-yield` means the tail stopped paying; lower `--min-yield` to keep digging. Otherwise the guard is too tight (row above) |
 | You need more than the run gave you | Raise `--target` and re-run. `stopped_because: target reached` on the last layer means the frontier still had unexpanded nodes, so there is more there |
-| Adjacent topics in the universe (a general "email" tail under a "cold email" seed) | The default guard keeps a keyword holding *any* seed word. Tighten to the phrase: `--must-include "cold email"` |
+| Adjacent topics in the universe | The guard requires every seed token already; tighten further to a phrase, `--must-include "cold email"` |
+| Layer 1 returns almost nothing, and the run warns about the seed | The seed is a question, not a keyword — autocomplete completes a *prefix*, and a six-word prefix has nothing to complete. Re-run on the head term the warning names (`best claude skills for X` -> `claude skills`); X comes back as a cluster with its demand attached |
 | Autocomplete returns almost nothing | The seed is too long or too rare — shorten it to the head term and let level 2 find the tail |
 | Search returns fewer than 5 results for many keywords | Those queries are too specific to map; note it and lean on the clusters that did resolve |
 | `coverage_pct` below 60 | Say so, `WebFetch` the top blocked pages, and keep unreadable pages off the medians |

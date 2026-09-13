@@ -116,7 +116,11 @@ def tokens(text):
 
 
 def core_tokens(seed):
-    toks = [t for t in tokens(seed) if t not in STOP and len(t) > 2]
+    # Length is not a proxy for meaning. Dropping tokens under three characters
+    # throws away exactly the ones that define a modern seed -- ai, ml, ui, ux,
+    # vr, ev, 3d -- and "ai harness" then guards on "harness" alone, which is a
+    # dog lead, a safety belt and a horse race before it is anything about AI.
+    toks = [t for t in tokens(seed) if t not in STOP and len(t) > 1]
     return toks or tokens(seed)
 
 
@@ -135,22 +139,57 @@ analyser dashboard portal engine engines""".split())
 
 
 def required_tokens(seed):
-    """Tokens that keep a suggestion on-topic -- at least one must survive.
+    """The tokens a suggestion has to keep to still be about this topic.
 
     Autocomplete happily walks away from your seed ("how espresso machine"
     completes to "how coffee machine"), so a drift guard is worth having. The
     guard has to hold onto what makes the seed *this* topic, which is the part
     that is not the category noun: "espresso", not "machine"; "cold email", not
-    "software". Requiring any one of those keeps the legitimate long tail --
-    which rarely repeats every word of the seed -- while still dropping
-    suggestions that have wandered into a different subject.
+    "software"; "ai harness", not "harness".
+
+    Every one of them has to survive, not just one. A compound seed is usually
+    compound because neither half means the topic on its own -- "ai" and
+    "harness" are each enormous and unrelated subjects, and a guard satisfied
+    by either fills the universe with dog leads and horse racing. Requiring all
+    of them costs some legitimate tail ("cold outreach tools" under a "cold
+    email software" seed) and buys precision, which is the better trade when
+    the sample downstream costs a web search per keyword.
 
     A seed that is nothing but category nouns ("project management software")
     falls back to its own content tokens, because some guard beats none.
+
+    The conjunction is capped at three tokens. Past that the filter asks a real
+    query to repeat more of the seed than real queries do -- "best claude
+    skills for data analysis" would demand claude AND skills AND data AND
+    analysis, and drop "claude skills for data science" for the last one. A
+    seed that long is over-specified anyway, and expand_keywords warns about it
+    separately rather than silently returning nothing.
     """
     toks = core_tokens(seed)
     distinctive = [t for t in toks if t not in GENERIC_HEAD]
-    return distinctive or toks or [seed.lower()]
+    return (distinctive or toks or [seed.lower()])[:3]
+
+
+def token_matchers(required):
+    """Match each token as a word, loosening only where it is safe to.
+
+    Three rules, and the length is what picks between them, because the risk
+    runs the opposite way at each end:
+
+      <= 3 chars   whole word only -- "ai" must not match training, and once
+                   anchored to a word start it must not match airtag, aircraft
+                   or airlift either, which is most of what an "ai harness"
+                   universe fills up with otherwise
+      >= 4 chars   word prefix -- long tokens are safe to loosen, and the
+                   morphology is worth having: "email" catches emailing and
+                   emails, "harness" catches harnesses and harnessing
+      phrases      as written, at a word start ("cold email" -> cold emailing)
+    """
+    out = []
+    for t in required:
+        stem = re.escape(t)
+        out.append(re.compile(r"\b%s\b" % stem if len(t) <= 3 else r"\b%s" % stem))
+    return out
 
 
 def intent_prior(keyword):
@@ -435,6 +474,7 @@ def main():
         required = [norm(t) for t in args.must_include.split(",") if norm(t)]
     else:
         required = required_tokens(seed)
+    matchers = token_matchers(required)
 
     sug = Suggest(args.locale, args.delay)
     keywords, dropped = {}, []
@@ -444,10 +484,11 @@ def main():
         key = norm(text)
         if not key or (key == seed and level > 0):
             return
-        if required and not any(t in key for t in required):
+        missing = [t for t, m in zip(required, matchers) if not m.search(key)]
+        if missing:
             dropped.append({"keyword": key, "probe": probe,
-                            "reason": "drifted off-topic: has none of %s"
-                                      % ", ".join(repr(t) for t in required)})
+                            "reason": "drifted off-topic: missing %s"
+                                      % ", ".join(repr(t) for t in missing)})
             return
         if len(key) > 140 or len(key.split()) > 14:
             dropped.append({"keyword": key, "probe": probe, "reason": "too long to be a query"})
@@ -509,6 +550,31 @@ def main():
                "stopped_because": "seed probe shapes exhausted",
                "seconds": round(time.time() - t_layer, 1)}]
     log("  -> %d keywords (%.0fs)" % (len(keywords), time.time() - t0), args.quiet)
+
+    # A layer 1 this thin is not a small market, it is the wrong kind of seed:
+    # autocomplete completes a prefix, and a six-word prefix has almost nothing
+    # to complete. Say so here rather than letting a one-keyword universe look
+    # like a finding about demand.
+    warnings = []
+    if len(keywords) - 1 < 40:
+        # The head term is the first two *content* tokens, not the first two
+        # words: "best claude skills for coding" heads to "claude skills", and
+        # suggesting "best claude" would send the rerun somewhere useless.
+        head = " ".join(core_tokens(seed)[:2])
+        warnings.append(
+            "layer 1 returned only %d keywords from %d probes. A seed this "
+            "specific has almost nothing to complete -- try the head term "
+            "(\"%s\") and let the deeper layers find this niche as a cluster."
+            % (len(keywords) - 1, len(wave), head))
+        if len(dropped) > 3 * max(1, len(keywords) - 1):
+            warnings.append(
+                "%d suggestions were dropped against %d kept. The guard %s is "
+                "asking a real query to repeat more of the seed than real "
+                "queries do -- widen it with --must-include, or shorten the seed."
+                % (len(dropped), len(keywords) - 1, required))
+        for w in warnings:
+            log("  WARNING: %s" % w, args.quiet)
+        log("  (head term suggestion: %r)" % head, args.quiet)
 
     # -- breadth-first from there ------------------------------------------
     # One layer at a time, and a layer is finished before the next one starts.
@@ -700,6 +766,7 @@ def main():
                    "ranking": SCORE_WEIGHTS,
                    "layer1_exhaustive": True,
                    "min_yield": args.min_yield, "wave": args.wave,
+                   "warnings": warnings,
                    "branch_cap": args.branch,
                    "frontier_fully_explored": complete,
                    "layers": layers},
@@ -731,6 +798,7 @@ def main():
                       "by_level": payload["stats"]["by_level"],
                       "by_intent_prior": payload["stats"]["by_intent_prior"],
                       "dropped_off_topic": len(dropped),
+                      "warnings": warnings,
                       "frontier_fully_explored": complete,
                       "layers": [{"layer": ly["layer"], "discovered": ly["discovered"],
                                   "expanded": "%s of %s nodes in layer %s"
