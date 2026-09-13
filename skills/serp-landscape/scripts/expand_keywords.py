@@ -138,6 +138,44 @@ makers builder builders generator generators tracker trackers checker checkers a
 analyser dashboard portal engine engines""".split())
 
 
+# Mass nouns have no plural, and "softwares" or "equipments" is ninety wasted
+# probes returning nothing. Only the heads likely to end a seed are listed.
+UNCOUNTABLE = set("""software hardware firmware middleware freeware shareware equipment
+furniture information advice research news music audio video content data media training
+maintenance insurance marketing advertising accounting consulting support hosting storage
+bandwidth traffic revenue analytics intelligence automation security compliance""".split())
+
+
+def singular(word):
+    """Drop a plural 's' where doing so is safe. '' when there is nothing to drop."""
+    if len(word) >= 4 and word.endswith("s") and not word.endswith(("ss", "us", "is", "os")):
+        return word[:-1]
+    return ""
+
+
+def seed_forms(seed):
+    """The seed and its singular/plural twin, both probed at layer 1.
+
+    Autocomplete is literal. "claude skill" and "claude skills" are the same
+    topic to a human and two different prefixes to the API, and a run seeded
+    with one explores a frontier the other never reaches: measured at 35%
+    overlap on a real run, each form finding ~2,900 keywords the other missed,
+    with every plural-only keyword passing the singular run's own guard. The
+    gap was never the filter -- it was that the probes only ever asked for one
+    form. So layer 1 asks for both, which costs about ninety extra calls and is
+    inherited by every layer below it.
+    """
+    toks = seed.split()
+    if not toks:
+        return [seed]
+    last = toks[-1]
+    twin = singular(last) or (last + "s" if len(last) >= 3 and not last.endswith("s")
+                              and last not in UNCOUNTABLE else "")
+    if not twin:
+        return [seed]
+    return [seed, " ".join(toks[:-1] + [twin])]
+
+
 def required_tokens(seed):
     """The tokens a suggestion has to keep to still be about this topic.
 
@@ -167,7 +205,12 @@ def required_tokens(seed):
     """
     toks = core_tokens(seed)
     distinctive = [t for t in toks if t not in GENERIC_HEAD]
-    return (distinctive or toks or [seed.lower()])[:3]
+    picked = (distinctive or toks or [seed.lower()])[:3]
+    # Stem the plural so a "claude skills" seed guards identically to a
+    # "claude skill" one -- prefix matching then covers both forms, and the two
+    # seeds stop producing two different universes of the same topic. Only the
+    # seed-derived set is stemmed; an explicit --must-include is taken literally.
+    return [singular(t) or t for t in picked]
 
 
 def token_matchers(required):
@@ -278,18 +321,25 @@ class Suggest:
 
 
 def seed_probes(seed, letters=True, digits=False):
-    """Prefixes to complete at level 1. Order matters: the plain seed first,
-    then the modifier families, then the alphabet -- so a run cut short still
-    has the high-value shapes rather than 'seed a' through 'seed f'."""
-    out = [seed]
-    out += ["%s %s" % (w, seed) for w in QUESTION_WORDS]
-    out += ["%s %s" % (seed, w) for w in COMMERCIAL_WORDS]
-    out += ["%s %s" % (w, seed) for w in ("best", "top", "cheap", "free", "buy")]
-    out += ["%s %s" % (seed, w) for w in RELATION_WORDS]
-    if letters:
-        out += ["%s %s" % (seed, c) for c in LETTERS]
-    if digits:
-        out += ["%s %s" % (seed, d) for d in "0123456789"]
+    """Prefixes to complete at layer 1.
+
+    Every form of the seed gets the full shape treatment, and the order matters
+    twice over: the plain seeds first, then the modifier families, then the
+    alphabet, and within each the given seed before its twin -- so a run cut
+    short still has the high-value shapes of the form the user actually asked
+    for, rather than 'seed a' through 'seed f'.
+    """
+    forms = seed_forms(seed)
+    out = list(forms)
+    for shapes, template in (
+            (QUESTION_WORDS, "%(w)s %(s)s"),
+            (COMMERCIAL_WORDS, "%(s)s %(w)s"),
+            (("best", "top", "cheap", "free", "buy"), "%(w)s %(s)s"),
+            (RELATION_WORDS, "%(s)s %(w)s"),
+            (LETTERS if letters else (), "%(s)s %(w)s"),
+            ("0123456789" if digits else (), "%(s)s %(w)s")):
+        for w in shapes:
+            out += [template % {"w": w, "s": s} for s in forms]
     return list(dict.fromkeys(out))
 
 

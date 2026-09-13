@@ -59,9 +59,20 @@ seed + relation words         espresso machine for, espresso machine with, ...
 seed + a..z                   espresso machine a, espresso machine b, ...
 ```
 
-Around 90 probes, and they are layer 1. The order matters: the plain seed and the modifier
-families run before the alphabet, so a run cut short still has the high-value
-shapes rather than `seed a` through `seed f`.
+Every shape is asked of **both forms of the seed**, singular and plural, so
+"claude skill" also probes "claude skills". Autocomplete is literal: the two
+are one topic to a reader and two different prefixes to the API. Seeded with
+one form alone, a real run reached only 35% of the keywords the other found —
+and every keyword the plural run found would have passed the singular run's own
+guard, so the gap was never the filter, only which prefixes were ever asked.
+Probing both raised layer 1 by 65% and met the same target in half the calls,
+because breadth at layer 1 is inherited by every layer under it. Mass nouns are
+left alone: there is no "softwares" to ask for.
+
+Around 180 probes, and they are layer 1. The order matters: the plain seeds and
+the modifier families run before the alphabet, and the form you actually typed
+runs before its twin, so a run cut short still has the high-value shapes rather
+than `seed a` through `seed f`.
 
 ## Going deeper: a breadth-first search
 
