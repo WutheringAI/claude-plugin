@@ -10,9 +10,11 @@ can trace is a guess wearing a number.
 Three things happen here:
 
   1. EXPAND   probe autocomplete in waves -- seed, then question/commercial/
-              relation/alphabet shapes, then re-probe what came back, up to
-              --depth levels. Thousands of keywords for a few hundred cheap
-              API calls.
+              relation/alphabet shapes, then re-probe what came back. Each
+              level is sized from how far the universe still is from --target
+              and draws from every keyword not yet probed, so the expansion
+              runs until the target is met, the well runs dry, or --depth
+              levels are spent. Thousands of keywords for cheap API calls.
   2. CLUSTER  group the universe by shared wording, so you know how much demand
               sits behind each topic rather than treating 4,000 keywords as
               4,000 separate problems.
@@ -29,8 +31,9 @@ Four sources, and they are not interchangeable:
 
 Usage:
     python3 expand_keywords.py "espresso machine" --out keywords.json
-    python3 expand_keywords.py "espresso machine" --target 10000 --branch 400 --sample 150
+    python3 expand_keywords.py "espresso machine" --target 10000 --sample 150
     python3 expand_keywords.py "cold email software" --sources google,youtube --locale en-GB
+    python3 expand_keywords.py "cold email software" --must-include "cold email"
 """
 
 import argparse
@@ -115,16 +118,37 @@ def core_tokens(seed):
     return toks or tokens(seed)
 
 
-def anchor_token(seed):
-    """The token a drifted suggestion is least likely to keep by accident.
+# Head nouns that name the category rather than the subject. These are the
+# words autocomplete swaps most freely -- "cold email software" completes to
+# "cold email tool", "cold email platform", "cold email client" -- and they are
+# very often the longest word in the seed, so anchoring on length pins the
+# whole universe to the one token searchers vary most and throws the topic
+# away. Anchor on what is left of the seed instead.
+GENERIC_HEAD = set("""software tool tools app apps application applications platform platforms
+service services system systems solution solutions program programs suite suites product
+products machine machines device devices company companies vendor vendors provider providers
+agency agencies website websites site sites page pages online management manager taking maker
+makers builder builders generator generators tracker trackers checker checkers analyzer
+analyser dashboard portal engine engines""".split())
 
-    Autocomplete happily walks away from your seed -- "how espresso machine"
-    completes to "how coffee machine". Requiring the longest content token
-    catches that without discarding the legitimate long tail, which rarely
-    repeats every word of the seed.
+
+def required_tokens(seed):
+    """Tokens that keep a suggestion on-topic -- at least one must survive.
+
+    Autocomplete happily walks away from your seed ("how espresso machine"
+    completes to "how coffee machine"), so a drift guard is worth having. The
+    guard has to hold onto what makes the seed *this* topic, which is the part
+    that is not the category noun: "espresso", not "machine"; "cold email", not
+    "software". Requiring any one of those keeps the legitimate long tail --
+    which rarely repeats every word of the seed -- while still dropping
+    suggestions that have wandered into a different subject.
+
+    A seed that is nothing but category nouns ("project management software")
+    falls back to its own content tokens, because some guard beats none.
     """
     toks = core_tokens(seed)
-    return max(toks, key=len) if toks else seed.lower()
+    distinctive = [t for t in toks if t not in GENERIC_HEAD]
+    return distinctive or toks or [seed.lower()]
 
 
 def intent_prior(keyword):
@@ -328,17 +352,22 @@ def main():
     ap.add_argument("--locale", default="en-US", help="language-REGION, e.g. en-GB, de-DE")
     ap.add_argument("--sources", default="google",
                     help="comma-separated: google,youtube,ddg,bing (default google)")
-    ap.add_argument("--depth", type=int, default=3,
-                    help="1 = probes on the seed only; 2-3 re-probe what came back (default 3)")
-    ap.add_argument("--branch", type=int, default=150,
-                    help="keywords re-probed at each deeper level (default 150)")
+    ap.add_argument("--depth", type=int, default=6,
+                    help="most levels of re-probing to run (default 6). Levels stop early once "
+                         "--target is met or a level stops returning anything new, so this is a "
+                         "ceiling rather than a plan")
+    ap.add_argument("--branch", type=int, default=900,
+                    help="most keywords re-probed in any one level (default 900). Each level "
+                         "actually probes what the shortfall to --target needs, up to this cap")
     ap.add_argument("--extra", default="",
                     help="comma-separated keywords you found elsewhere (related searches, "
                          "People Also Ask); kept verbatim with source=manual")
     ap.add_argument("--extra-file", help="file with one such keyword per line")
     ap.add_argument("--must-include", default="",
-                    help="token every keyword must contain (default: longest seed token). "
-                         "Pass '-' to keep everything autocomplete returns.")
+                    help="comma-separated tokens; a keyword is kept if it contains any one of "
+                         "them (default: the seed's own tokens minus category nouns like "
+                         "'software' or 'platform'). Pass '-' to keep everything autocomplete "
+                         "returns.")
     ap.add_argument("--df-ceiling", type=float, default=0.05,
                     help="a word used by more than this share of the universe cannot anchor a "
                          "topic (default 0.05) -- it stops a near-synonym of the seed from "
@@ -355,7 +384,12 @@ def main():
     sources = [s.strip() for s in args.sources.split(",") if s.strip() in ENDPOINTS]
     if not sources:
         raise SystemExit("no valid --sources; choose from %s" % ", ".join(ENDPOINTS))
-    required = "" if args.must_include == "-" else (norm(args.must_include) or anchor_token(seed))
+    if args.must_include == "-":
+        required = []
+    elif args.must_include.strip():
+        required = [norm(t) for t in args.must_include.split(",") if norm(t)]
+    else:
+        required = required_tokens(seed)
 
     sug = Suggest(args.locale, args.delay)
     keywords, dropped = {}, []
@@ -365,9 +399,10 @@ def main():
         key = norm(text)
         if not key or (key == seed and level > 0):
             return
-        if required and required not in key:
+        if required and not any(t in key for t in required):
             dropped.append({"keyword": key, "probe": probe,
-                            "reason": "drifted off-topic: missing %r" % required})
+                            "reason": "drifted off-topic: has none of %s"
+                                      % ", ".join(repr(t) for t in required)})
             return
         if len(key) > 140 or len(key.split()) > 14:
             dropped.append({"keyword": key, "probe": probe, "reason": "too long to be a query"})
@@ -404,19 +439,43 @@ def main():
     # This is where "going deeper" happens. A level-1 keyword is already a real
     # query; completing it again returns the specific, lower-competition tail
     # that never appears when you only ever complete the seed.
+    #
+    # Two rules keep the universe from stalling far below --target. Branches are
+    # drawn from every keyword not yet probed rather than only the ones found in
+    # the previous level -- one thin level used to starve every level after it
+    # while hundreds of unprobed keywords sat in the pool unused. And each level
+    # is sized from the shortfall, so --target drives the expansion instead of
+    # only trimming it at the end.
+    probed = set(wave) | {seed}
+    per_probe = 4.0                  # revised from what each level actually returns
     for level in range(2, max(2, args.depth + 1)):
-        if len(keywords) >= args.target * 4:
-            log("level %d: skipped, universe already %d" % (level, len(keywords)), args.quiet)
+        if len(keywords) >= args.target:
+            log("level %d: skipped, universe already at target (%d)"
+                % (level, len(keywords)), args.quiet)
             break
-        parents = [k for k in keywords.values() if k["level"] == level - 1]
-        if not parents:
+        candidates = [k for k in keywords.values() if k["keyword"] not in probed]
+        if not candidates:
+            log("level %d: every keyword has been probed" % level, args.quiet)
             break
-        branches = pick_branches(parents, args.branch)
-        log("level %d: re-probing %d keywords" % (level, len(branches)), args.quiet)
-        for source, probe, hits in harvest(sug, sources[:1], branches, args.workers):
+        short = args.target - len(keywords)
+        want = int(short / max(0.5, per_probe)) + 1
+        branches = pick_branches(candidates, max(1, min(len(candidates), args.branch, want)))
+        before = len(keywords)
+        log("level %d: re-probing %d of %d unprobed keywords (%d short of target)"
+            % (level, len(branches), len(candidates), short), args.quiet)
+        for source, probe, hits in harvest(sug, sources, branches, args.workers):
             for text, rank, rel in hits:
                 add(text, level, "%s:suggest" % source, probe, rank, rel)
-        log("  -> %d keywords (%.0fs)" % (len(keywords), time.time() - t0), args.quiet)
+        probed.update(branches)
+        gained = len(keywords) - before
+        per_probe = max(0.2, gained / float(len(branches)))
+        log("  -> %d keywords (+%d, %.1f new per probe, %.0fs)"
+            % (len(keywords), gained, per_probe, time.time() - t0), args.quiet)
+        # A topic with only 800 real queries in it should not grind through
+        # every remaining level to prove it.
+        if gained < len(branches) * 0.25:
+            log("  diminishing returns; stopping at %d keywords" % len(keywords), args.quiet)
+            break
 
     # -- keywords you brought yourself -------------------------------------
     manual = [k.strip() for k in args.extra.split(",") if k.strip()]
@@ -507,6 +566,7 @@ def main():
     payload = {
         "seed": seed, "locale": args.locale, "sources": sources, "depth": args.depth,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        # must_include is the token set; a keyword holding any one of them was kept.
         "target": args.target, "sample_size": len(sample), "must_include": required or None,
         "api_calls": sug.calls, "elapsed_seconds": round(time.time() - t0, 1),
         "stats": {"discovered": len(keywords), "kept": len(pool),

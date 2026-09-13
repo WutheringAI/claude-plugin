@@ -123,19 +123,36 @@ machine` completes to `how coffee machine`, and `a espresso machine` to `a
 coffee machine game`. Left alone, a few hundred off-topic keywords enter the
 universe and every downstream number is diluted.
 
-The filter is one token — by default the longest content word in the seed —
-that every keyword must contain. For "espresso machine" that is `espresso`,
-which keeps "best espresso machine under $500" and drops "coffee machine
-game". Dropped keywords are recorded with the reason in `keywords.json`, so
-you can check the filter was not too aggressive.
+The filter is a small set of tokens, and a keyword is kept if it contains any
+one of them. By default the set is the seed's own content words **minus the
+category noun** — the `software`, `platform`, `tool`, `app`, `machine` half of
+the seed. For "espresso machine" that leaves `espresso`, which keeps "best
+espresso machine under $500" and drops "coffee machine game". For "cold email
+software" it leaves `cold, email`, which keeps "cold email templates" and "cold
+outreach tools" and drops "ai noise cancelling software".
 
-Override it when the seed's defining word is not its longest:
-`--must-include crm`. Pass `--must-include -` to keep everything, which is
-occasionally right for a very broad seed and usually not.
+Dropping the category noun matters more than it looks. It is usually the
+longest word in the seed and always the word searchers vary most freely —
+autocomplete answers "cold email software" with "cold email tool", "cold email
+platform", "cold email client" — so requiring it pins the universe to the one
+token the market does not agree on. Requiring it discarded about three
+quarters of that seed's real demand.
 
-**When `dropped_off_topic` is large relative to what was kept**, look at the
-dropped list before doing anything else. Either the seed is ambiguous, or the
-anchor token is wrong.
+Because the default set is deliberately permissive, adjacent topics do get in:
+requiring `cold` *or* `email` admits some general email-marketing queries.
+That is the trade, and it is the cheaper mistake — clustering separates them,
+and the sample review in step 2 of the skill is there to catch the rest.
+
+Tighten it with a phrase when a seed's meaning lives in the pair rather than
+either word: `--must-include "cold email"` (substring matching, so it still
+catches "cold emailing"). Comma-separated values are alternatives, not
+requirements: `--must-include "crm,pipeline"`. Pass `--must-include -` to keep
+everything, which is occasionally right for a very broad seed and usually not.
+
+Dropped keywords are recorded with the reason in `keywords.json`. **When
+`dropped_off_topic` is large relative to what was kept**, read the dropped list
+before doing anything else — either the seed is ambiguous, or the filter is
+wrong for it.
 
 ## Locales and non-English seeds
 
@@ -156,11 +173,11 @@ US rankings is two datasets pretending to be one.
 |---|---|
 | `--target N` | Universe size. 5,000 default; raise it freely, the calls are cheap |
 | `--sample N` | Keywords marked for SERP capture. This one decides run length |
-| `--depth 1..3` | 1 is seed-only and fast; 3 is the default and where the tail is |
-| `--branch N` | Keywords re-probed per deeper level. 300 gets you ~5,000; 400+ for 10,000 |
+| `--depth N` | Ceiling on re-probing levels, default 6. Levels stop early once `--target` is met or a level stops returning anything new, so raising it costs nothing on a topic that is already exhausted. `--depth 1` is seed-only and fast |
+| `--branch N` | Ceiling on keywords re-probed in any one level, default 900. Each level probes what the shortfall to `--target` actually needs, so this only binds on very large targets |
 | `--sources` | `google,youtube` when the topic has a how-to half |
 | `--locale` | Autocomplete is locale-specific; match it to the market |
-| `--must-include` | The relevance anchor. Set it when the seed's key word is not its longest |
+| `--must-include` | The drift guard. Set it to a phrase (`"cold email"`) when the default token set lets adjacent topics in |
 | `--df-ceiling` | Lower it (0.03) if a near-synonym of the seed is swallowing topics |
 | `--extra` / `--extra-file` | Keywords you found elsewhere — related searches, People Also Ask, the user's own list. Kept verbatim with `source: manual` |
 | `--no-letters` | Skips the a-z round: ~25% fewer calls, noticeably less tail |
