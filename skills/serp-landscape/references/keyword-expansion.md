@@ -9,7 +9,7 @@ expansion has gone somewhere you did not intend.
 - [Why autocomplete](#why-autocomplete)
 - [The four sources](#the-four-sources)
 - [How the probes work](#how-the-probes-work)
-- [Going deeper](#going-deeper)
+- [Going deeper: a breadth-first search](#going-deeper-a-breadth-first-search)
 - [Topics and demand mass](#topics-and-demand-mass)
 - [Choosing the SERP sample](#choosing-the-serp-sample)
 - [Drift, and the token that stops it](#drift-and-the-token-that-stops-it)
@@ -59,31 +59,93 @@ seed + relation words         espresso machine for, espresso machine with, ...
 seed + a..z                   espresso machine a, espresso machine b, ...
 ```
 
-Around 90 probes at level 1. The order matters: the plain seed and the modifier
+Around 90 probes, and they are layer 1. The order matters: the plain seed and the modifier
 families run before the alphabet, so a run cut short still has the high-value
 shapes rather than `seed a` through `seed f`.
 
-## Going deeper
+## Going deeper: a breadth-first search
 
 Completing the seed forever only ever returns the head of the market. Depth is
-where the specific, low-competition tail lives, so each deeper level re-probes
-keywords that already came back:
+where the specific, low-competition tail lives, so keywords that came back get
+re-probed in turn. The search is **breadth-first**: a layer is finished before
+the next one starts.
 
 ```
-level 1   ~950 keywords     completions of the seed
-level 2   ~2,400 keywords   completions of 150-300 level-1 keywords
-level 3   ~1,500 keywords   completions of those
+layer 0   the seed
+layer 1   completions of the seed through every probe shape   -- always expanded in full
+layer 2   completions of every layer-1 keyword
+layer 3   completions of every layer-2 keyword
+...
 ```
 
-Branches are chosen by rotating through distinct modifier shapes rather than by
-taking the top N. Ranking by relevance alone digs the same hole deeper: the top
-150 completions of one seed are mostly one phrasing, and their completions are
-too.
+That ordering is the point, not an implementation detail. A keyword two
+completions from the seed is a different kind of query from one five
+completions out — broader, higher-volume, more contested — and a search that
+mixes layers explores neither properly. Going depth-first, or greedily by
+score, produces a universe that is deep in a few phrasings and blind
+everywhere else, and nothing in the output tells you which.
 
-When the universe gets trimmed to `--target`, each level keeps a quota
-(roughly 40/35/25 across levels 1-3). Sorting by level instead would put every
-deep keyword last and a small target would silently throw away the entire point
-of digging.
+**Layer 1 is always expanded to exhaustion**, whatever `--branch` says. It is
+the breadth every deeper layer inherits: leave one layer-1 node unprobed and
+the entire subtree under it is missing from the universe with nothing to mark
+that it ever existed. Layer 1 is small — tens to a low thousand nodes — so
+completing it is cheap, and it is the only layer where completeness is worth
+buying unconditionally.
+
+Every layer below it is ranked, then expanded in waves of `--wave` nodes, and
+allowed to stop where it stops paying (`--min-yield` new keywords per probe) or
+at `--branch` nodes.
+
+### The ranking
+
+Deeper layers can be too large to exhaust, so the order matters — and "worth
+expanding" is a different question from "good keyword". A long, highly specific
+query can be an excellent keyword and a dead end as a probe, because there is
+nothing left to append to it. Each node scores on five signals:
+
+| signal | weight | why |
+|---|---|---|
+| `relevance` | 0.34 | Google's own `suggestrelevance` for the node |
+| `headroom` | 0.21 | short queries have room to complete; a 12-word one does not |
+| `corroboration` | 0.16 | returned by many different probes — a hub, not a leaf |
+| `parentage` | 0.15 | its parent probe was productive, so siblings likely are |
+| `rank` | 0.14 | where it sat in the suggestion list |
+
+The score is written to each keyword as `expansion_score`, and the weights are
+copied into `search.ranking`, so the order a run chose can be audited rather
+than taken on trust.
+
+Ranked order alone would still dig one hole: the top 150 completions of one
+seed are mostly one phrasing, and so are their completions. So the ranked
+frontier is bucketed by each node's leading modifier and the buckets are
+rotated through — best node from each, biggest bucket first. A layer expanded
+to exhaustion ends up with the same set either way; this decides the order,
+which is what matters when a deeper layer stops early.
+
+### What the JSON records
+
+`search.layers` carries one entry per layer, and it is the record that
+distinguishes a small topic from an abandoned search:
+
+```json
+{"layer": 3, "from_layer": 2, "discovered": 872, "frontier": 264,
+ "expanded": 264, "probes": 264, "policy": "ranked",
+ "stopped_because": "layer exhausted", "seconds": 11.3}
+```
+
+`policy` is the rule the layer ran under (`exhaustive` for layer 1, `ranked`
+below it); `stopped_because` is what actually happened, so a `ranked` layer
+that ran out of frontier still reports `layer exhausted`.
+`search.frontier_fully_explored` is true only when every layer ended that way.
+
+Each keyword carries its own place in the tree: `level` (its layer), `probe`
+(the query whose completion produced it), `rank` and `relevance` within that
+suggestion list, plus `expanded`, `children_found` and `expansion_score`.
+
+When the universe gets trimmed to `--target`, **layer 1 is kept whole** and
+deeper layers keep a quota (roughly 35/25/20/15). Sorting by layer instead
+would put every deep keyword last and a small target would silently throw away
+the entire point of digging.
 
 ## Topics and demand mass
 
@@ -173,8 +235,10 @@ US rankings is two datasets pretending to be one.
 |---|---|
 | `--target N` | Universe size. 5,000 default; raise it freely, the calls are cheap |
 | `--sample N` | Keywords marked for SERP capture. This one decides run length |
-| `--depth N` | Ceiling on re-probing levels, default 6. Levels stop early once `--target` is met or a level stops returning anything new, so raising it costs nothing on a topic that is already exhausted. `--depth 1` is seed-only and fast |
-| `--branch N` | Ceiling on keywords re-probed in any one level, default 900. Each level probes what the shortfall to `--target` actually needs, so this only binds on very large targets |
+| `--depth N` | Deepest layer to reach, default 6. Layers stop early once `--target` is met or the frontier runs dry, so raising it costs nothing on a topic that is already exhausted. `--depth 1` is seed-only and fast |
+| `--branch N` | Ceiling on nodes expanded in any one layer *below layer 1*, default 1500. Layer 1 is always expanded in full |
+| `--wave N` | Nodes probed per wave inside a layer, default 150. Yield is measured per wave, so this is the granularity at which a layer can stop early |
+| `--min-yield F` | New keywords per probe below which a layer below layer 1 stops, default 0.6. Lower it to keep digging a thin topic |
 | `--sources` | `google,youtube` when the topic has a how-to half |
 | `--locale` | Autocomplete is locale-specific; match it to the market |
 | `--must-include` | The drift guard. Set it to a phrase (`"cold email"`) when the default token set lets adjacent topics in |

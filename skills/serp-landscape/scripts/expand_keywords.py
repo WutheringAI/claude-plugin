@@ -9,12 +9,14 @@ can trace is a guess wearing a number.
 
 Three things happen here:
 
-  1. EXPAND   probe autocomplete in waves -- seed, then question/commercial/
-              relation/alphabet shapes, then re-probe what came back. Each
-              level is sized from how far the universe still is from --target
-              and draws from every keyword not yet probed, so the expansion
-              runs until the target is met, the well runs dry, or --depth
-              levels are spent. Thousands of keywords for cheap API calls.
+  1. EXPAND   a breadth-first search over autocomplete. Layer 1 is the seed
+              put through every probe shape -- question, commercial, relation,
+              alphabet -- and it is always expanded in full, because it is the
+              breadth every deeper layer inherits. Each layer after it is
+              ranked by expansion_score, expanded in waves, and allowed to stop
+              where it stops paying. A layer is finished before the next one
+              begins, and keywords.json records each layer's frontier, how much
+              of it was expanded, and why it stopped.
   2. CLUSTER  group the universe by shared wording, so you know how much demand
               sits behind each topic rather than treating 4,000 keywords as
               4,000 separate problems.
@@ -267,26 +269,62 @@ def harvest(sug, sources, queries, workers=8):
     return out
 
 
-def pick_branches(pool, limit):
-    """Choose which keywords to dig under.
+# ------------------------------------------------------------------ ranking
 
-    Ranking by relevance alone digs the same hole deeper: the top 150
-    completions of one seed are mostly one phrasing. Rotating through distinct
-    modifier shapes spends the same budget across the market instead.
+# What the expansion score is made of, and why each part earns its weight.
+# Exposed in keywords.json as `expansion_score` so the order a run chose can be
+# audited rather than taken on trust.
+SCORE_WEIGHTS = {
+    "relevance": 0.34,      # Google's own suggestrelevance for the node
+    "rank": 0.14,           # where it sat in the suggestion list
+    "corroboration": 0.16,  # how many different probes returned it: a hub, not a leaf
+    "headroom": 0.21,       # short queries have room to complete; a 12-word one does not
+    "parentage": 0.15,      # its parent probe was productive, so siblings likely are
+}
+
+
+def expansion_score(entry, max_relevance, parent_yield):
+    """How much unexplored breadth probably sits under this keyword.
+
+    Autocomplete completes a prefix, so expanding a node returns what people
+    type *after* it. That makes "worth expanding" a different question from
+    "important keyword": a long, highly specific query can be a fine keyword
+    and a dead end as a probe, because there is nothing left to append. The
+    score below is about breadth still available, not about the keyword's own
+    value -- which is why headroom carries almost as much weight as relevance.
+    """
+    rel = (entry.get("relevance") or 0) / max_relevance if max_relevance else 0.0
+    rank = 1.0 / (1.0 + max(0, entry.get("rank") or 0))
+    corroboration = min(entry.get("seen_in_probes", 1), 5) / 5.0
+    headroom = max(0.0, (12 - entry.get("words", 1)) / 11.0)
+    w = SCORE_WEIGHTS
+    return round(w["relevance"] * rel + w["rank"] * rank
+                 + w["corroboration"] * corroboration + w["headroom"] * headroom
+                 + w["parentage"] * parent_yield, 4)
+
+
+def order_frontier(entries, scores):
+    """Rank a whole layer for expansion, without digging one hole.
+
+    Score order alone would expand fifty phrasings of one sub-topic before
+    touching another, so a layer cut short would come back lopsided. Bucketing
+    by each node's leading modifier and rotating through the buckets -- best
+    node from each, biggest bucket first -- spends the layer across the market
+    instead. A layer expanded to exhaustion ends up with the same set either
+    way; this only decides the order, which is what matters when a deeper layer
+    stops early.
     """
     buckets = defaultdict(list)
-    for k in sorted(pool, key=lambda k: (-(k["relevance"] or 0), k["rank"], k["chars"])):
-        buckets[k["modifiers"][0] if k["modifiers"] else "_seed"].append(k)
-    picked, exhausted = [], False
-    while len(picked) < limit and not exhausted:
-        exhausted = True
-        for shape in sorted(buckets, key=lambda s: -len(buckets[s])):
+    for e in sorted(entries, key=lambda e: (-scores.get(e["keyword"], 0.0), e["chars"])):
+        buckets[e["modifiers"][0] if e["modifiers"] else "_seed"].append(e)
+    order = []
+    while True:
+        live = [s for s in buckets if buckets[s]]
+        if not live:
+            return order
+        for shape in sorted(live, key=lambda s: -len(buckets[s])):
             if buckets[shape]:
-                picked.append(buckets[shape].pop(0)["keyword"])
-                exhausted = False
-                if len(picked) >= limit:
-                    break
-    return picked
+                order.append(buckets[shape].pop(0)["keyword"])
 
 
 # ---------------------------------------------------------------- clustering
@@ -353,12 +391,19 @@ def main():
     ap.add_argument("--sources", default="google",
                     help="comma-separated: google,youtube,ddg,bing (default google)")
     ap.add_argument("--depth", type=int, default=6,
-                    help="most levels of re-probing to run (default 6). Levels stop early once "
-                         "--target is met or a level stops returning anything new, so this is a "
-                         "ceiling rather than a plan")
-    ap.add_argument("--branch", type=int, default=900,
-                    help="most keywords re-probed in any one level (default 900). Each level "
-                         "actually probes what the shortfall to --target needs, up to this cap")
+                    help="deepest layer to reach (default 6). 1 is the seed's own probes and "
+                         "nothing else. Layers stop early once --target is met or the frontier "
+                         "runs dry, so this is a ceiling rather than a plan")
+    ap.add_argument("--branch", type=int, default=1500,
+                    help="most nodes expanded in any one layer BELOW layer 1 (default 1500). "
+                         "Layer 1 is always expanded in full, because it is the breadth every "
+                         "deeper layer inherits")
+    ap.add_argument("--wave", type=int, default=150,
+                    help="nodes probed per wave inside a layer (default 150). Yield is measured "
+                         "per wave, so this is the granularity at which a layer can stop early")
+    ap.add_argument("--min-yield", type=float, default=0.6,
+                    help="new keywords per probe below which a layer below layer 1 stops "
+                         "(default 0.6). Lower it to keep digging a thin topic")
     ap.add_argument("--extra", default="",
                     help="comma-separated keywords you found elsewhere (related searches, "
                          "People Also Ask); kept verbatim with source=manual")
@@ -410,7 +455,9 @@ def main():
         prior = keywords.get(key)
         if prior:
             prior["seen_in_probes"] += 1
-            # The earliest, highest-ranked sighting is the honest provenance.
+            # Breadth-first, so the first sighting is the shallowest one and the
+            # layer a keyword is filed under is its true distance from the seed.
+            # Only a better rank within the same layer can revise the provenance.
             if (level, rank) < (prior["level"], prior["rank"]):
                 prior.update(level=level, source=source, probe=probe, rank=rank)
             if relevance and (prior.get("relevance") or 0) < relevance:
@@ -423,59 +470,129 @@ def main():
             "modifiers": modifiers(key, seed_tokens), "intent_prior": intent_prior(key),
             "is_question": bool(re.match(r"^(how|what|why|when|which|where|who|is|are|can|"
                                          r"does|do|should|will)\b", key)),
+            # BFS bookkeeping: was this node itself expanded, what did expanding
+            # it return, and what did the ranking think of it beforehand.
+            "expanded": False, "children_found": 0, "expansion_score": None,
         }
 
     add(seed, 0, "seed", "seed", 0, None)
 
-    # -- level 1 -----------------------------------------------------------
+    def expand(queries, layer, layers_seen):
+        """Probe a set of queries and file everything they return into `layer`.
+
+        Returns how many keywords were new, and credits each probed node with
+        the children it produced, which is what `parentage` scores next layer.
+        """
+        gained = 0
+        for source, probe, hits in harvest(sug, sources, queries, args.workers):
+            before = len(keywords)
+            for text, rank, rel in hits:
+                add(text, layer, "%s:suggest" % source, probe, rank, rel)
+            found = len(keywords) - before
+            gained += found
+            node = keywords.get(probe)
+            if node is not None:
+                node["children_found"] = node.get("children_found", 0) + found
+                node["expanded"] = True
+        layers_seen.update(queries)
+        return gained
+
+    # -- layer 1: complete the seed's own frontier --------------------------
     wave = seed_probes(seed, letters=not args.no_letters, digits=args.digits)
-    log("level 1: %d probes x %d source(s)" % (len(wave), len(sources)), args.quiet)
-    for source, probe, hits in harvest(sug, sources, wave, args.workers):
-        for text, rank, rel in hits:
-            add(text, 1, "%s:suggest" % source, probe, rank, rel)
+    log("layer 1: %d seed probes x %d source(s)" % (len(wave), len(sources)), args.quiet)
+    probed = {seed}
+    t_layer = time.time()
+    expand(wave, 1, probed)
+    layers = [{"layer": 1, "from_layer": 0, "discovered": len(keywords) - 1,
+               "frontier": 1, "expanded": 1,
+               "probes": len(wave) * len(sources), "policy": "exhaustive",
+               "stopped_because": "seed probe shapes exhausted",
+               "seconds": round(time.time() - t_layer, 1)}]
     log("  -> %d keywords (%.0fs)" % (len(keywords), time.time() - t0), args.quiet)
 
-    # -- deeper levels: re-probe what came back ----------------------------
-    # This is where "going deeper" happens. A level-1 keyword is already a real
-    # query; completing it again returns the specific, lower-competition tail
-    # that never appears when you only ever complete the seed.
+    # -- breadth-first from there ------------------------------------------
+    # One layer at a time, and a layer is finished before the next one starts.
+    # That ordering is the point: a keyword two completions from the seed is a
+    # different kind of query from one five completions out, and mixing them
+    # means a run cut short has explored neither properly. Layer 1 is always
+    # expanded to exhaustion, because it is the breadth every later layer
+    # inherits -- leave a layer-1 node unprobed and the whole subtree under it
+    # is missing from the universe with nothing to show that it ever existed.
     #
-    # Two rules keep the universe from stalling far below --target. Branches are
-    # drawn from every keyword not yet probed rather than only the ones found in
-    # the previous level -- one thin level used to starve every level after it
-    # while hundreds of unprobed keywords sat in the pool unused. And each level
-    # is sized from the shortfall, so --target drives the expansion instead of
-    # only trimming it at the end.
-    probed = set(wave) | {seed}
-    per_probe = 4.0                  # revised from what each level actually returns
-    for level in range(2, max(2, args.depth + 1)):
+    # Deeper layers are ranked by expansion_score and expanded in waves, so a
+    # layer can stop where it stops paying rather than at a fixed budget. What
+    # a layer did, and why it stopped, is recorded in `layers` for audit.
+    for src_layer in range(1, max(1, args.depth)):
         if len(keywords) >= args.target:
-            log("level %d: skipped, universe already at target (%d)"
-                % (level, len(keywords)), args.quiet)
+            log("layer %d: not expanded, universe already at target (%d)"
+                % (src_layer, len(keywords)), args.quiet)
             break
-        candidates = [k for k in keywords.values() if k["keyword"] not in probed]
-        if not candidates:
-            log("level %d: every keyword has been probed" % level, args.quiet)
+        frontier = [k for k in keywords.values()
+                    if k["level"] == src_layer and k["keyword"] not in probed]
+        if not frontier:
+            log("layer %d: empty, nothing left to expand" % src_layer, args.quiet)
             break
-        short = args.target - len(keywords)
-        want = int(short / max(0.5, per_probe)) + 1
-        branches = pick_branches(candidates, max(1, min(len(candidates), args.branch, want)))
-        before = len(keywords)
-        log("level %d: re-probing %d of %d unprobed keywords (%d short of target)"
-            % (level, len(branches), len(candidates), short), args.quiet)
-        for source, probe, hits in harvest(sug, sources, branches, args.workers):
-            for text, rank, rel in hits:
-                add(text, level, "%s:suggest" % source, probe, rank, rel)
-        probed.update(branches)
-        gained = len(keywords) - before
-        per_probe = max(0.2, gained / float(len(branches)))
-        log("  -> %d keywords (+%d, %.1f new per probe, %.0fs)"
-            % (len(keywords), gained, per_probe, time.time() - t0), args.quiet)
-        # A topic with only 800 real queries in it should not grind through
-        # every remaining level to prove it.
-        if gained < len(branches) * 0.25:
-            log("  diminishing returns; stopping at %d keywords" % len(keywords), args.quiet)
-            break
+
+        max_rel = max((e.get("relevance") or 0) for e in frontier)
+        max_children = max([keywords[e["probe"]].get("children_found", 0)
+                            for e in frontier if e["probe"] in keywords] or [0])
+        scores = {}
+        for e in frontier:
+            parent = keywords.get(e["probe"])
+            parent_yield = ((parent.get("children_found", 0) / max_children)
+                            if parent and max_children else 1.0)
+            e["expansion_score"] = expansion_score(e, max_rel, parent_yield)
+            scores[e["keyword"]] = e["expansion_score"]
+        order = order_frontier(frontier, scores)
+
+        # Layer 1 is exhaustive by design. A deeper layer gets its whole frontier
+        # ranked and then spends up to --branch of it, stopping sooner when the
+        # wave loop below sees --target met or the yield collapse.
+        exhaustive = src_layer == 1
+        budget = len(order) if exhaustive else min(len(order), args.branch)
+        t_layer, spent, gained_total = time.time(), 0, 0
+        stopped = "layer exhausted"
+        log("layer %d -> %d: %d nodes on the frontier, expanding %s"
+            % (src_layer, src_layer + 1, len(order),
+               "all of them" if exhaustive else "up to %d" % budget), args.quiet)
+
+        while spent < budget:
+            if len(keywords) >= args.target:
+                stopped = "target reached"
+                break
+            # Clamped to the budget, not just sized by --wave: an unclamped
+            # final wave overshoots a --branch cap by up to a whole wave.
+            chunk = order[spent: min(spent + args.wave, budget)]
+            gained = expand(chunk, src_layer + 1, probed)
+            spent += len(chunk)
+            gained_total += gained
+            rate = gained / float(len(chunk))
+            log("    %d/%d probed, +%d (%.1f new per probe), %d keywords (%.0fs)"
+                % (spent, budget, gained, rate, len(keywords), time.time() - t0), args.quiet)
+            # A topic with 800 real queries in it should not grind through every
+            # remaining node to prove it -- but only a deeper layer may give up,
+            # because layer 1 decides the breadth of everything below it.
+            if not exhaustive and rate < args.min_yield:
+                stopped = "yield %.1f fell below --min-yield %.1f" % (rate, args.min_yield)
+                break
+        else:
+            if not exhaustive and spent < len(order):
+                stopped = "--branch cap of %d reached" % args.branch
+
+        # "layer 3, from_layer 2, expanded 266 of a 266-node frontier" reads as
+        # one sentence: which layer this produced, and how much of the layer
+        # below it was opened to produce it.
+        layers.append({"layer": src_layer + 1, "from_layer": src_layer,
+                       "discovered": gained_total,
+                       "frontier": len(order), "expanded": spent,
+                       "probes": spent * len(sources),
+                       # the rule the layer ran under; stopped_because is what
+                       # actually happened, and a ranked layer may still exhaust
+                       "policy": "exhaustive" if exhaustive else "ranked",
+                       "stopped_because": stopped,
+                       "seconds": round(time.time() - t_layer, 1)})
+        log("  layer %d done: +%d keywords from %d nodes (%s)"
+            % (src_layer + 1, gained_total, spent, stopped), args.quiet)
 
     # -- keywords you brought yourself -------------------------------------
     manual = [k.strip() for k in args.extra.split(",") if k.strip()]
@@ -491,15 +608,18 @@ def main():
                          "rank": 0, "relevance": None, "seen_in_probes": 1,
                          "words": len(key.split()), "chars": len(key),
                          "modifiers": modifiers(key, seed_tokens), "intent_prior": intent_prior(key),
-                         "is_question": False}
+                         "is_question": False,
+                         "expanded": False, "children_found": 0, "expansion_score": None}
 
     # -- trim to --target, keeping the depth ------------------------------
-    # Sorting by level would put every deep keyword last and a target smaller
+    # Sorting by layer would put every deep keyword last and a target smaller
     # than the universe would then quietly throw away the whole point of
-    # digging. Quotas keep each level's share of the set.
+    # digging. Quotas keep each layer's share of the set -- and layer 1 is kept
+    # whole, because it was expanded exhaustively to establish the breadth and
+    # trimming it would throw that away at the last step.
     pool = list(keywords.values())
     if len(pool) > args.target:
-        share = {0: 1.0, 1: 0.40, 2: 0.35, 3: 0.25, 4: 0.15}
+        share = {0: 1.0, 1: 1.0, 2: 0.35, 3: 0.25, 4: 0.20, 5: 0.15}
         by_level = defaultdict(list)
         for k in pool:
             by_level[k["level"]].append(k)
@@ -563,12 +683,26 @@ def main():
         by_intent[k["intent_prior"]] += 1
         by_level_count[k["level"]] += 1
 
+    # Every layer's frontier size, how much of it was expanded, and why it
+    # stopped. This is the record that says whether a short universe means the
+    # topic is small or means the search gave up -- which is the difference
+    # between a finding and a gap.
+    complete = all(ly.get("stopped_because") in ("layer exhausted",
+                                                 "seed probe shapes exhausted")
+                   for ly in layers)
     payload = {
         "seed": seed, "locale": args.locale, "sources": sources, "depth": args.depth,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         # must_include is the token set; a keyword holding any one of them was kept.
         "target": args.target, "sample_size": len(sample), "must_include": required or None,
         "api_calls": sug.calls, "elapsed_seconds": round(time.time() - t0, 1),
+        "search": {"strategy": "breadth-first",
+                   "ranking": SCORE_WEIGHTS,
+                   "layer1_exhaustive": True,
+                   "min_yield": args.min_yield, "wave": args.wave,
+                   "branch_cap": args.branch,
+                   "frontier_fully_explored": complete,
+                   "layers": layers},
         "stats": {"discovered": len(keywords), "kept": len(pool),
                   "clusters": len(clusters), "dropped_off_topic": len(dropped),
                   "by_level": dict(sorted(by_level_count.items())),
@@ -597,6 +731,13 @@ def main():
                       "by_level": payload["stats"]["by_level"],
                       "by_intent_prior": payload["stats"]["by_intent_prior"],
                       "dropped_off_topic": len(dropped),
+                      "frontier_fully_explored": complete,
+                      "layers": [{"layer": ly["layer"], "discovered": ly["discovered"],
+                                  "expanded": "%s of %s nodes in layer %s"
+                                              % (ly["expanded"], ly["frontier"],
+                                                 ly["from_layer"]),
+                                  "stopped_because": ly["stopped_because"]}
+                                 for ly in layers],
                       "probe_failures": len(sug.failures)}, indent=2))
 
 
